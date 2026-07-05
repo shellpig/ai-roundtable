@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 圓桌</title>
+<style>
+  :root {
+    --bg: #101418; --panel: #181f26; --line: #2a3540;
+    --text: #dfe7ee; --dim: #8fa0af; --me: #2b3d52;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.65 "Microsoft JhengHei", "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; margin: 0 4px 0 0; letter-spacing: 1px; flex: 0 0 auto; }
+  #sessionTitle {
+    flex: 0 1 280px; min-width: 90px; max-width: 280px;
+    border: 1px solid var(--line); border-radius: 14px; color: var(--text);
+    background: rgba(255,255,255,.03); padding: 3px 10px; cursor: pointer;
+    font-size: 13px; line-height: 1.5; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #sessionTitle:hover { border-color: #4c8bf5; }
+  .title-input {
+    flex: 0 1 280px; min-width: 120px; max-width: 280px;
+    background: var(--bg); color: var(--text); border: 1px solid #4c8bf5;
+    border-radius: 8px; font: inherit; font-size: 13px; padding: 3px 8px;
+  }
+  .title-input:focus { outline: none; }
+  #chips { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .chip {
+    border: 1px solid var(--line); border-radius: 16px; padding: 4px 12px;
+    cursor: pointer; user-select: none; color: var(--dim); background: transparent;
+    font-size: 13px; transition: all .15s;
+  }
+  .chip.on { color: #fff; border-color: currentColor; }
+  .chip .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 6px; background: currentColor; opacity: .4; }
+  .chip.on .dot { opacity: 1; }
+  .chip.busy .dot { animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .15; } }
+  .seat { display: inline-flex; align-items: center; gap: 4px; }
+  .mselect {
+    background: var(--bg); color: var(--dim); border: 1px solid var(--line);
+    border-radius: 8px; font-size: 12px; padding: 3px 4px; max-width: 190px;
+  }
+  .mselect:focus { outline: none; border-color: #4c8bf5; }
+  #newBtn { margin-left: auto; background: none; border: 1px solid var(--line);
+    color: var(--dim); border-radius: 8px; padding: 4px 10px; cursor: pointer; }
+  #newBtn:hover { color: var(--text); }
+  main { flex: 1; overflow-y: auto; padding: 18px 0 8px; }
+  .row { max-width: 860px; margin: 0 auto 14px; padding: 0 16px; display: flex; }
+  .bubble {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 10px 14px; max-width: 88%; white-space: pre-wrap; word-break: break-word;
+  }
+  .row.me { justify-content: flex-end; }
+  .row.me .bubble { background: var(--me); border-color: #3c5677; }
+  .who { font-size: 12px; font-weight: bold; margin-bottom: 4px; }
+  .who .sub { font-weight: normal; color: var(--dim); margin-left: 6px; font-size: 11px; }
+  .who .ts { font-weight: normal; color: var(--dim); margin-left: 8px; font-size: 11px; }
+  .row.sys .bubble { border-style: dashed; color: var(--dim); font-size: 13px; }
+  .typing { color: var(--dim); font-size: 13px; font-style: italic; }
+  footer { background: var(--panel); border-top: 1px solid var(--line); padding: 12px 16px; }
+  .composer { max-width: 860px; margin: 0 auto; display: flex; gap: 10px; }
+  textarea {
+    flex: 1; resize: none; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+    font: inherit; min-height: 44px; max-height: 160px;
+  }
+  textarea:focus { outline: none; border-color: #4c8bf5; }
+  #sendBtn {
+    background: #2f6fda; color: #fff; border: none; border-radius: 10px;
+    padding: 0 22px; font: inherit; cursor: pointer;
+  }
+  #sendBtn:disabled { opacity: .45; cursor: default; }
+  .hint { max-width: 860px; margin: 6px auto 0; color: var(--dim); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AI 圓桌</h1>
+  <span id="sessionTitle" title="點擊修改會議名稱">未命名會議</span>
+  <span id="chips"></span>
+  <button id="newBtn" title="歸檔目前逐字稿並開新會議">🧹 新會議</button>
+</header>
+<main id="log"></main>
+<footer>
+  <div class="composer">
+    <textarea id="input" placeholder="輸入發言…（Enter 送出，Shift+Enter 換行）"></textarea>
+    <button id="sendBtn">送出</button>
+  </div>
+  <div class="hint">送出後會自動徵詢所有<b>已啟用</b>的參與者；點上方名字可把 AI 拉進 / 移出圓桌。</div>
+</footer>
+<script>
+const state = { total: 0, participants: {}, enabled: {}, busy: [], sessionTitle: '未命名會議' };
+const $ = id => document.getElementById(id);
+let editingTitle = false;
+
+function esc(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderSessionTitle() {
+  if (editingTitle) return;
+  const el = $('sessionTitle');
+  el.textContent = state.sessionTitle || '未命名會議';
+  el.title = `點擊修改會議名稱\n${state.sessionTitle || '未命名會議'}`;
+}
+
+function startTitleEdit() {
+  if (editingTitle) return;
+  editingTitle = true;
+  const current = state.sessionTitle || '未命名會議';
+  const el = $('sessionTitle');
+  const input = document.createElement('input');
+  input.className = 'title-input';
+  input.value = current;
+  input.setAttribute('aria-label', '會議名稱');
+  el.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let finished = false;
+  const finish = async save => {
+    if (finished) return;
+    finished = true;
+    editingTitle = false;
+    const span = document.createElement('span');
+    span.id = 'sessionTitle';
+    span.title = '點擊修改會議名稱';
+    span.onclick = startTitleEdit;
+    input.replaceWith(span);
+    if (save) await saveTitle(input.value);
+    renderSessionTitle();
+  };
+
+  input.onkeydown = e => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  };
+  input.onblur = () => finish(true);
+}
+
+async function saveTitle(value) {
+  const title = (value || '').trim() || '未命名會議';
+  state.sessionTitle = title;
+  const r = await fetch('/api/title', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title })
+  });
+  if (r.ok) {
+    const j = await r.json();
+    state.sessionTitle = j.title || title;
+  } else {
+    alert('會議名稱儲存失敗，請重試');
+  }
+}
+
+$('sessionTitle').onclick = startTitleEdit;
+
+const seats = {}; // name -> { chip, sel }；只建一次，之後原地更新，避免輪詢重建把展開中的選單關掉
+
+function buildChips() {
+  const el = $('chips');
+  el.innerHTML = '';
+  for (const [name, p] of Object.entries(state.participants)) {
+    const seat = document.createElement('span');
+    seat.className = 'seat';
+    const c = document.createElement('span');
+    c.innerHTML = `<span class="dot"></span>${esc(p.display)}`;
+    c.title = '點擊拉進 / 移出圓桌';
+    c.onclick = () => { state.enabled[name] = !state.enabled[name]; updateChips(); };
+    seat.appendChild(c);
+    const sel = document.createElement('select');
+    sel.className = 'mselect';
+    sel.title = '選擇這個席位使用的模型';
+    for (const m of p.models) {
+      const o = document.createElement('option');
+      o.value = m; o.textContent = m;
+      sel.appendChild(o);
+    }
+    sel.value = p.selected;
+    sel.onchange = async () => {
+      const label = sel.value;
+      state.participants[name].selected = label; // 樂觀更新，防止下一輪 poll 蓋回舊值
+      const r = await fetch('/api/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, label })
+      });
+      if (!r.ok) alert('模型切換失敗，請重試');
+    };
+    seat.appendChild(sel);
+    el.appendChild(seat);
+    seats[name] = { chip: c, sel };
+  }
+  updateChips();
+}
+
+function updateChips() {
+  for (const [name, p] of Object.entries(state.participants)) {
+    const s = seats[name];
+    if (!s) continue;
+    s.chip.className = 'chip' + (state.enabled[name] ? ' on' : '') + (state.busy.includes(name) ? ' busy' : '');
+    s.chip.style.color = state.enabled[name] ? p.color : '';
+    // 使用者正在操作的選單絕不去動；其餘情況才同步伺服器端的選擇
+    if (document.activeElement !== s.sel && s.sel.value !== p.selected) s.sel.value = p.selected;
+  }
+}
+
+function addBubble(m) {
+  const p = state.participants[m.speaker];
+  const row = document.createElement('div');
+  const isMe = m.speaker === '你';
+  row.className = 'row' + (isMe ? ' me' : '') + (m.speaker === 'system' ? ' sys' : '');
+  const color = p ? p.color : (isMe ? '#9fc1ea' : '#8fa0af');
+  const label = p ? p.display : m.speaker;
+  const sub = m.sub ? `<span class="sub">${esc(m.sub)}</span>` : '';
+  row.innerHTML = `<div class="bubble"><div class="who" style="color:${color}">${esc(label)}${sub}<span class="ts">${esc(m.ts || '')}</span></div>${esc(m.text)}</div>`;
+  $('log').appendChild(row);
+}
+
+function renderTyping() {
+  document.querySelectorAll('.typing').forEach(e => e.remove());
+  for (const name of state.busy) {
+    const p = state.participants[name];
+    const d = document.createElement('div');
+    d.className = 'row typing';
+    d.innerHTML = `<div class="bubble typing">${esc(p ? p.display : name)} 思考中…</div>`;
+    $('log').appendChild(d);
+  }
+}
+
+async function poll() {
+  try {
+    const r = await fetch(`/api/state?since=${state.total}`);
+    const j = await r.json();
+    state.participants = j.participants;
+    state.sessionTitle = j.session_title || '未命名會議';
+    renderSessionTitle();
+    if (Object.keys(state.enabled).length === 0) {
+      for (const [n, p] of Object.entries(j.participants)) if (!p.manual) state.enabled[n] = true;
+    }
+    const nearBottom = $('log').scrollHeight - $('log').scrollTop - $('log').clientHeight < 80;
+    if (j.total < state.total) { $('log').innerHTML = ''; state.total = 0; return poll(); }
+    j.messages.forEach(addBubble);
+    state.total = j.total;
+    state.busy = j.busy;
+    if (Object.keys(seats).length === 0) buildChips(); else updateChips();
+    renderTyping();
+    if ((j.messages.length || j.busy.length) && nearBottom) $('log').scrollTop = $('log').scrollHeight;
+  } catch (e) { /* server 未起或暫時斷線，下一輪再試 */ }
+}
+
+async function send() {
+  const text = $('input').value.trim();
+  if (!text) return;
+  const ask = Object.entries(state.enabled).filter(([, v]) => v).map(([k]) => k);
+  $('sendBtn').disabled = true;
+  try {
+    await fetch('/api/send', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, ask })
+    });
+    $('input').value = '';
+    await poll();
+  } finally { $('sendBtn').disabled = false; $('input').focus(); }
+}
+
+$('sendBtn').onclick = send;
+$('input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$('newBtn').onclick = async () => {
+  if (!confirm('歸檔目前逐字稿並開新會議？')) return;
+  const r = await fetch('/api/new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  if (r.ok) {
+    const j = await r.json();
+    state.sessionTitle = j.session_title || '未命名會議';
+  }
+  $('log').innerHTML = ''; state.total = 0;
+  renderSessionTitle();
+};
+
+poll();
+setInterval(poll, 1500);
+</script>
+</body>
+</html>
