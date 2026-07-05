@@ -1,4 +1,4 @@
-﻿# ai-roundtable: 多 AI 圓桌討論室（localhost 單機工具）
+# ai-roundtable: 多 AI 圓桌討論室（localhost 單機工具）
 # 參與者 = CLI 呼叫配方；逐字稿(jsonl + md 鏡像)是唯一資料層。
 import json
 import os
@@ -81,9 +81,15 @@ DEFAULT_SELECTIONS = {
 _lock = threading.Lock()
 _messages = []
 _busy = {}  # name -> started_ts
+_processes = {}  # name -> subprocess.Popen
+_cancel_requested = set()
 _selected = {}  # name -> label
 _project_dir = DEFAULT_PROJECT_DIR
 _active_session = {"title": UNNAMED_TITLE, "created_at": None}
+
+
+class CallCancelled(Exception):
+    pass
 
 
 def _now():
@@ -349,7 +355,66 @@ def _find_claude():
     return str(max(candidates, key=ver_key)) if candidates else None
 
 
-def _call_codex(instr, opt, env_extra=None):
+def _terminate_process(proc):
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+            )
+        except Exception:  # noqa: BLE001 - fallback to Popen termination below
+            pass
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:  # noqa: BLE001 - final best-effort kill
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def _run_process(name, args, *, input_text=None, stdin=None, cwd=None, env=None, timeout=CALL_TIMEOUT):
+    proc = subprocess.Popen(
+        args,
+        stdin=subprocess.PIPE if input_text is not None else stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=cwd,
+        env=env,
+        shell=False,
+    )
+    with _lock:
+        _processes[name] = proc
+    try:
+        try:
+            stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_process(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except Exception:
+                stdout, stderr = "", ""
+            raise
+        return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+    finally:
+        with _lock:
+            if _processes.get(name) is proc:
+                _processes.pop(name, None)
+            cancelled = name in _cancel_requested
+            if cancelled:
+                _cancel_requested.discard(name)
+        if cancelled:
+            raise CallCancelled()
+
+
+def _call_codex(name, instr, opt, env_extra=None):
     env = os.environ.copy()
     if env_extra:
         env.update(env_extra)
@@ -361,10 +426,7 @@ def _call_codex(instr, opt, env_extra=None):
         out_path = tf.name
     args += ["-o", out_path]
     try:
-        proc = subprocess.run(
-            args, input=instr, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=CALL_TIMEOUT, env=env, shell=False,
-        )
+        proc = _run_process(name, args, input_text=instr, env=env, timeout=CALL_TIMEOUT)
         result = Path(out_path).read_text(encoding="utf-8", errors="replace").strip()
         if not result:
             tail = (proc.stdout or "").strip().splitlines()[-15:]
@@ -382,21 +444,20 @@ def _call_codex(instr, opt, env_extra=None):
             pass
 
 
-def _call_agy(instr, opt):
-    proc = subprocess.run(
-        [AGY_EXE, "-p", instr, "--model", opt["model"],
-         "--add-dir", _project_dir, "--add-dir", str(DATA),
-         "--dangerously-skip-permissions", "--print-timeout", f"{CALL_TIMEOUT - 60}s"],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=CALL_TIMEOUT,
-    )
+def _call_agy(name, instr, opt):
+    args = [
+        AGY_EXE, "-p", instr, "--model", opt["model"],
+        "--add-dir", _project_dir, "--add-dir", str(DATA),
+        "--dangerously-skip-permissions", "--print-timeout", f"{CALL_TIMEOUT - 60}s",
+    ]
+    proc = _run_process(name, args, stdin=subprocess.DEVNULL, timeout=CALL_TIMEOUT)
     result = (proc.stdout or "").strip()
     if not result:
         raise RuntimeError("agy 沒有輸出。stderr：" + (proc.stderr or "")[-500:])
     return result
 
 
-def _call_claude(instr, opt):
+def _call_claude(name, instr, opt):
     exe = _find_claude()
     if not exe:
         raise RuntimeError("找不到 claude.exe（桌面 app 的 claude-code 資料夾不存在？）")
@@ -404,10 +465,7 @@ def _call_claude(instr, opt):
             "--allowedTools", "Read,Glob,Grep,WebSearch,WebFetch", "--add-dir", str(DATA)]
     if opt.get("effort"):
         args += ["--effort", opt["effort"]]
-    proc = subprocess.run(
-        args, cwd=_project_dir, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=CALL_TIMEOUT,
-    )
+    proc = _run_process(name, args, cwd=_project_dir, stdin=subprocess.DEVNULL, timeout=CALL_TIMEOUT)
     result = (proc.stdout or "").strip()
     if proc.returncode != 0 or not result:
         raise RuntimeError(f"claude exit={proc.returncode}。stderr：" + (proc.stderr or "")[-500:])
@@ -415,8 +473,8 @@ def _call_claude(instr, opt):
 
 
 ADAPTERS = {
-    "codex": lambda instr, opt: _call_codex(instr, opt),
-    "ds": lambda instr, opt: _call_codex(instr, opt, {"CODEX_HOME": DS_CODEX_HOME}),
+    "codex": lambda name, instr, opt: _call_codex(name, instr, opt),
+    "ds": lambda name, instr, opt: _call_codex(name, instr, opt, {"CODEX_HOME": DS_CODEX_HOME}),
     "agy": _call_agy,
     "claude": _call_claude,
 }
@@ -425,8 +483,10 @@ ADAPTERS = {
 def _worker(name):
     opt = _option(name)
     try:
-        text = ADAPTERS[name](_instruction(name), opt)
+        text = ADAPTERS[name](name, _instruction(name), opt)
         append_message(name, text, sub=opt["label"])
+    except CallCancelled:
+        append_message("system", f"⚠ {PARTICIPANTS[name]['display']}（{opt['label']}）已由使用者取消本次呼叫")
     except Exception as e:  # noqa: BLE001 - 任何失敗都要回報進聊天室
         append_message("system", f"⚠ {PARTICIPANTS[name]['display']}（{opt['label']}）呼叫失敗：{e}")
     finally:
@@ -446,6 +506,18 @@ def ask(names):
         threading.Thread(target=_worker, args=(name,), daemon=True).start()
         started.append(name)
     return started
+
+
+def cancel_call(name):
+    if name not in ADAPTERS:
+        return False
+    with _lock:
+        proc = _processes.get(name)
+        if name not in _busy or proc is None:
+            return False
+        _cancel_requested.add(name)
+    _terminate_process(proc)
+    return True
 
 
 def _participants_payload():
@@ -595,6 +667,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "started": started})
         elif self.path == "/api/ask":
             self._json({"ok": True, "started": ask(payload.get("names") or [])})
+        elif self.path == "/api/cancel":
+            self._json({"ok": True, "cancelled": cancel_call(payload.get("name"))})
         elif self.path == "/api/title":
             title = (payload.get("title") or "").strip() or UNNAMED_TITLE
             with _lock:

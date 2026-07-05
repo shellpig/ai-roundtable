@@ -68,6 +68,14 @@
   .who .ts { font-weight: normal; color: var(--dim); margin-left: 8px; font-size: 11px; }
   .row.sys .bubble { border-style: dashed; color: var(--dim); font-size: 13px; }
   .typing { color: var(--dim); font-size: 13px; font-style: italic; }
+  .typing-bubble { display: inline-flex; align-items: center; gap: 10px; }
+  .cancelBtn {
+    background: transparent; border: 1px solid #6d3f45; color: #e6a0a7;
+    border-radius: 8px; padding: 2px 8px; cursor: pointer; font: inherit;
+    font-size: 12px; font-style: normal; line-height: 1.5;
+  }
+  .cancelBtn:hover { border-color: #e6a0a7; color: #fff; }
+  .cancelBtn:disabled { opacity: .45; cursor: default; }
   footer { background: var(--panel); border-top: 1px solid var(--line); padding: 12px 16px; }
   .composer { max-width: 860px; margin: 0 auto; display: flex; gap: 10px; }
   textarea {
@@ -228,14 +236,24 @@ function addBubble(m) {
 }
 
 function renderTyping() {
-  document.querySelectorAll('.typing').forEach(e => e.remove());
+  document.querySelectorAll('.row.typing').forEach(e => e.remove());
   for (const name of state.busy) {
     const p = state.participants[name];
     const d = document.createElement('div');
     d.className = 'row typing';
-    d.innerHTML = `<div class="bubble typing">${esc(p ? p.display : name)} 思考中…</div>`;
+    d.innerHTML = `<div class="bubble typing-bubble"><span>${esc(p ? p.display : name)} 思考中…</span><button class="cancelBtn" type="button" title="取消本次呼叫">取消</button></div>`;
+    d.querySelector('.cancelBtn').onclick = e => cancelCall(name, e.currentTarget);
     $('log').appendChild(d);
   }
+}
+
+async function cancelCall(name, button) {
+  if (button) button.disabled = true;
+  await fetch('/api/cancel', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name })
+  });
+  await poll();
 }
 
 async function poll() {
