@@ -86,6 +86,7 @@ _cancel_requested = set()
 _selected = {}  # name -> label
 _project_dir = DEFAULT_PROJECT_DIR
 _active_session = {"title": UNNAMED_TITLE, "created_at": None}
+_discussion = {"active": False, "round": 0, "max_rounds": 0}  # 共識討論模式的即時狀態（不持久化）
 
 
 class CallCancelled(Exception):
@@ -330,16 +331,39 @@ def append_message(speaker, text, sub=None):
     return msg
 
 
-def _instruction(name):
+def _instruction(name, phase=None):
+    # phase: None=單則回應（現況）; "first"=討論模式首輪（獨立陳述）; "debate"=討論模式辯論輪
     disp = PARTICIPANTS[name]["display"]
-    return (
+    head = (
         f"你是多 AI 圓桌規格討論會的參與者「{disp}」。\n"
         f"1. 先讀取逐字稿檔案（UTF-8）：{MD_MIRROR} —— 這是到目前為止的完整討論。\n"
         f"2. 討論主題通常圍繞位於 {_project_dir} 的專案，你可以唯讀查閱專案檔案來佐證論點。\n"
+    )
+    tail = "用繁體中文，發言精煉聚焦。絕對不要建立、修改或刪除任何檔案。\n"
+    if phase == "first":
+        return head + (
+            f"3. 這是「共識討論模式」的第一輪。此刻其他席位尚未針對本題發言、你看不到他們的意見。"
+            f"請以「{disp}」的身分，針對逐字稿最後主持人拋出的命題，獨立提出你的初始立場、你看到的風險、"
+            f"以及你偏好的方案。不要回應或揣測其他席位的意見，也不要在結尾加任何結論傾向標記。"
+            f"直接輸出發言內容本身，不要任何前綴、署名、標題或 markdown 程式碼圍欄。\n"
+            f"4. {tail}"
+        )
+    if phase == "debate":
+        return head + (
+            f"3. 這是「共識討論模式」的辯論輪。請回顧逐字稿中至今所有發言，以「{disp}」的身分針對彼此意見的"
+            f"「分歧點」回應：可反駁、修正、或讓步；不要重述別人已講過的論點，沒有新論點就直接表示同意。"
+            f"反附和原則：只有你真心同意目前方案、且它滿足你所代表模型的技術考量時，才標記共識；"
+            f"只要還有疑慮，就把「具體還沒解決的點」寫出來，不要為了收斂而附和。\n"
+            f"4. 發言最後一行必須是結論標記，二選一（照抄格式，不要多加標點）：\n"
+            f"結論傾向：共識\n"
+            f"結論傾向：保留—<一句話寫出你具體還沒解決的點>\n"
+            f"5. 直接輸出發言內容本身，不要任何前綴、署名、標題或 markdown 程式碼圍欄。{tail}"
+        )
+    return head + (
         f"3. 針對逐字稿最後的最新發言，以「{disp}」的身分發表一則回應：同意就說為什麼、"
         f"反對就給理由與替代方案、看到風險就指出來。直接輸出發言內容本身，"
         f"不要任何前綴、署名、標題或 markdown 程式碼圍欄。\n"
-        f"4. 用繁體中文，發言精煉聚焦。絕對不要建立、修改或刪除任何檔案。\n"
+        f"4. {tail}"
     )
 
 
@@ -480,10 +504,10 @@ ADAPTERS = {
 }
 
 
-def _worker(name):
+def _worker(name, phase=None):
     opt = _option(name)
     try:
-        text = ADAPTERS[name](name, _instruction(name), opt)
+        text = ADAPTERS[name](name, _instruction(name, phase), opt)
         append_message(name, text, sub=opt["label"])
     except CallCancelled:
         append_message("system", f"⚠ {PARTICIPANTS[name]['display']}（{opt['label']}）已由使用者取消本次呼叫")
@@ -494,7 +518,7 @@ def _worker(name):
             _busy.pop(name, None)
 
 
-def ask(names):
+def ask(names, phase=None):
     started = []
     for name in names:
         if name not in ADAPTERS:
@@ -503,7 +527,7 @@ def ask(names):
             if name in _busy:
                 continue
             _busy[name] = time.time()
-        threading.Thread(target=_worker, args=(name,), daemon=True).start()
+        threading.Thread(target=_worker, args=(name, phase), daemon=True).start()
         started.append(name)
     return started
 
@@ -518,6 +542,138 @@ def cancel_call(name):
         _cancel_requested.add(name)
     _terminate_process(proc)
     return True
+
+
+# ---- 共識討論模式 ----------------------------------------------------------
+# 首輪平行收集獨立初始意見，第 2 輪起 round-robin 序列辯論；全票「結論傾向：共識」
+# 才早停（首輪不判），到 max_rounds 仍未收斂就停下交主持人裁決。
+DISCUSSION_MIN_ROUNDS = 2  # 首輪只是獨立開場白、非交鋒，故實質下限為 2
+DISCUSSION_MAX_ROUNDS = 8
+_INTERRUPT_MSG = "⏸ 偵測到主持人插話，已中止自動討論，主導權交還主持人。"
+
+
+def _clamp_rounds(value):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = DISCUSSION_MIN_ROUNDS
+    return max(DISCUSSION_MIN_ROUNDS, min(DISCUSSION_MAX_ROUNDS, n))
+
+
+def _stance(text):
+    """讀取發言中最後一個「結論傾向」標記：consensus / reserved / None。"""
+    for line in reversed((text or "").splitlines()):
+        if "結論傾向" in line:
+            if "共識" in line:
+                return "consensus"
+            if "保留" in line:
+                return "reserved"
+            return None
+    return None
+
+
+def _wait_busy_clear(names):
+    """等到這批席位都離開 _busy（成功、失敗、取消都會清），或超時後放行。"""
+    deadline = time.time() + CALL_TIMEOUT + 30
+    while time.time() < deadline:
+        with _lock:
+            if not any(n in _busy for n in names):
+                return
+        time.sleep(0.3)
+
+
+def _host_interrupted(baseline):
+    with _lock:
+        return any(m.get("speaker") == "你" for m in _messages[baseline:])
+
+
+def _run_seat_sync(name, phase):
+    """序列輪：同步跑完一席（寫入逐字稿後才返回），下一席才讀得到它的發言。"""
+    with _lock:
+        if name in _busy:
+            return
+        _busy[name] = time.time()
+    _worker(name, phase)  # _worker 的 finally 會清 _busy
+
+
+def _round_stances(round_start, order):
+    """該輪成功發言者（speaker 屬於 order）的結論標記；失敗席會落在 system、不列入。"""
+    with _lock:
+        msgs = list(_messages[round_start:])
+    return {m["speaker"]: _stance(m.get("text")) for m in msgs if m.get("speaker") in order}
+
+
+def _final_stance_lines(order):
+    """每席最近一則發言裡的結論標記整行，供結束總結顯示。"""
+    with _lock:
+        msgs = list(_messages)
+    lines = {}
+    for m in reversed(msgs):
+        sp = m.get("speaker")
+        if sp in order and sp not in lines:
+            lines[sp] = next((ln.strip() for ln in reversed((m.get("text") or "").splitlines())
+                              if "結論傾向" in ln), None)
+        if len(lines) == len(order):
+            break
+    return lines
+
+
+def _append_discussion_summary(reason, rounds_done, max_rounds, order):
+    if reason == "consensus":
+        body = [f"✅ 共識討論在第 {rounds_done} 輪達成全票共識。"]
+    else:
+        body = [f"⏹ 共識討論已達上限 {max_rounds} 輪、仍未全票共識，交主持人裁決。"]
+    body.append("各席最終結論標記：")
+    lines = _final_stance_lines(order)
+    for name in order:
+        disp = PARTICIPANTS[name]["display"]
+        body.append(f"· {disp}：{lines.get(name) or '（未表態或呼叫失敗）'}")
+    append_message("system", "\n".join(body))
+
+
+def start_discussion(names, max_rounds):
+    with _lock:
+        if _discussion["active"]:
+            return False
+        _discussion.update({"active": True, "round": 1, "max_rounds": _clamp_rounds(max_rounds)})
+    threading.Thread(target=run_discussion, args=(names, max_rounds), daemon=True).start()
+    return True
+
+
+def run_discussion(names, max_rounds):
+    try:
+        order = [n for n in names if n in ADAPTERS]
+        if not order:
+            return
+        max_rounds = _clamp_rounds(max_rounds)
+        with _lock:
+            baseline = len(_messages)  # 本場討論起點；之後出現的「你」發言＝插話
+            _discussion.update({"round": 1, "max_rounds": max_rounds})
+
+        # 第 1 輪：平行呼叫，收集各席獨立初始意見；barrier 等全部跑完，此輪不判早停。
+        _wait_busy_clear(ask(order, phase="first"))
+        if _host_interrupted(baseline):
+            append_message("system", _INTERRUPT_MSG)
+            return
+
+        # 第 2 輪起：round-robin 序列，每席發言前都讀得到前一席剛寫進逐字稿的內容。
+        for r in range(2, max_rounds + 1):
+            with _lock:
+                _discussion["round"] = r
+                round_start = len(_messages)
+            for name in order:
+                if _host_interrupted(baseline):
+                    append_message("system", _INTERRUPT_MSG)
+                    return
+                _run_seat_sync(name, phase="debate")
+            stances = _round_stances(round_start, order)
+            if stances and all(v == "consensus" for v in stances.values()):
+                _append_discussion_summary("consensus", r, max_rounds, order)
+                return
+        _append_discussion_summary("max", max_rounds, max_rounds, order)
+    finally:
+        with _lock:
+            _discussion["active"] = False
 
 
 def _participants_payload():
@@ -647,6 +803,7 @@ class Handler(BaseHTTPRequestHandler):
                     "participants": _participants_payload(),
                     "project_dir": _project_dir,
                     "session_title": _session_title(),
+                    "discussion": dict(_discussion),
                 })
         else:
             self._json({"error": "not found"}, 404)
@@ -661,10 +818,23 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/send":
             text = (payload.get("text") or "").strip()
             speaker = payload.get("speaker") or "你"
-            if text:
-                append_message(speaker, text)
-            started = ask(payload.get("ask") or [])
-            self._json({"ok": True, "started": started})
+            with _lock:
+                discussing = _discussion["active"]
+            if discussing:
+                # 討論進行中：發言視為插話寫入，run_discussion 會偵測並中止；不另外觸發呼叫
+                if text:
+                    append_message(speaker, text)
+                self._json({"ok": True, "interrupted": True})
+            elif payload.get("mode") == "discussion":
+                if text:
+                    append_message(speaker, text)
+                names = payload.get("ask") or []
+                self._json({"ok": True, "discussion": start_discussion(names, payload.get("max_rounds", 3))})
+            else:
+                if text:
+                    append_message(speaker, text)
+                started = ask(payload.get("ask") or [])
+                self._json({"ok": True, "started": started})
         elif self.path == "/api/ask":
             self._json({"ok": True, "started": ask(payload.get("names") or [])})
         elif self.path == "/api/cancel":

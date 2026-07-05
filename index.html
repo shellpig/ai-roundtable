@@ -90,6 +90,15 @@
   }
   #sendBtn:disabled { opacity: .45; cursor: default; }
   .hint { max-width: 860px; margin: 6px auto 0; color: var(--dim); font-size: 12px; }
+  .hint .opt { margin-right: 10px; color: var(--text); cursor: pointer; }
+  .hint .opt input[type=number] {
+    width: 46px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 1px 4px; font: inherit; font-size: 12px;
+  }
+  .discuss-bar {
+    max-width: 860px; margin: 0 auto 10px; padding: 6px 12px; font-size: 13px;
+    border: 1px solid #3c5677; border-radius: 8px; background: rgba(47,111,218,.12); color: var(--text);
+  }
 </style>
 </head>
 <body>
@@ -101,11 +110,16 @@
 </header>
 <main id="log"></main>
 <footer>
+  <div id="discussBar" class="discuss-bar" style="display:none"></div>
   <div class="composer">
     <textarea id="input" placeholder="輸入發言…（Enter 送出，Shift+Enter 換行）"></textarea>
     <button id="sendBtn">送出</button>
   </div>
-  <div class="hint">送出後會自動徵詢所有<b>已啟用</b>的參與者；點上方名字可把 AI 拉進 / 移出圓桌。</div>
+  <div class="hint">
+    <label class="opt"><input type="checkbox" id="consensusMode"> 共識討論模式</label>
+    <span id="roundsWrap" class="opt" style="display:none">最多 <input type="number" id="maxRounds" min="2" max="8" value="3"> 輪</span>
+    <span id="hintText">送出後會自動徵詢所有<b>已啟用</b>的參與者；點上方名字可把 AI 拉進 / 移出圓桌。</span>
+  </div>
 </footer>
 <script>
 const state = { total: 0, participants: {}, enabled: {}, busy: [], sessionTitle: '未命名會議' };
@@ -263,6 +277,7 @@ async function poll() {
     state.participants = j.participants;
     state.sessionTitle = j.session_title || '未命名會議';
     renderSessionTitle();
+    renderDiscussBar(j.discussion);
     if (Object.keys(state.enabled).length === 0) {
       for (const [n, p] of Object.entries(j.participants)) if (!p.manual) state.enabled[n] = true;
     }
@@ -281,15 +296,35 @@ async function send() {
   const text = $('input').value.trim();
   if (!text) return;
   const ask = Object.entries(state.enabled).filter(([, v]) => v).map(([k]) => k);
+  const body = { text, ask };
+  if ($('consensusMode').checked) {
+    body.mode = 'discussion';
+    body.max_rounds = Math.max(2, Math.min(8, parseInt($('maxRounds').value, 10) || 3));
+  }
   $('sendBtn').disabled = true;
   try {
     await fetch('/api/send', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, ask })
+      body: JSON.stringify(body)
     });
     $('input').value = '';
     await poll();
   } finally { $('sendBtn').disabled = false; $('input').focus(); }
+}
+
+$('consensusMode').onchange = () => {
+  $('roundsWrap').style.display = $('consensusMode').checked ? '' : 'none';
+};
+
+function renderDiscussBar(d) {
+  const bar = $('discussBar');
+  if (d && d.active) {
+    bar.style.display = '';
+    const stage = d.round <= 1 ? '第 1 輪 · 各席獨立表態中' : `第 ${d.round}/${d.max_rounds} 輪`;
+    bar.textContent = `🗣 共識討論進行中 · ${stage}（送出任何發言即可插話中止）`;
+  } else {
+    bar.style.display = 'none';
+  }
 }
 
 $('sendBtn').onclick = send;
