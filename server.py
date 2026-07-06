@@ -33,6 +33,11 @@ MAX_AUTO_ROUNDS = 2
 INVITE_TTL_SECONDS = 180
 SESSION_COOKIE = "ai_roundtable_session"
 
+# 公開 demo 模式：對外經 Tailscale Funnel 曝露時開啟。
+# 開啟後不再因來源是 loopback 就自動給 HOST（Funnel 轉發的公網流量在本機也是 127.0.0.1）。
+PUBLIC_MODE = os.environ.get("AI_ROUNDTABLE_PUBLIC") == "1"
+PUBLIC_URL = (os.environ.get("AI_ROUNDTABLE_PUBLIC_URL") or "").strip().rstrip("/")
+
 # 每席位的可選模型；label 顯示在 UI 與訊息氣泡，其餘欄位由各 adapter 解讀。
 PARTICIPANTS = {
     "codex": {
@@ -95,6 +100,7 @@ _active_session = {"title": UNNAMED_TITLE, "created_at": None}
 _discussion = {"active": False, "round": 0, "max_rounds": 0}  # 共識討論模式的即時狀態（不持久化）
 _auth_sessions = {}  # session_id -> {"role": "host"|"guest", "name": str, ...}
 _invites = {}  # token -> {"role", "expires_at"}
+_host_bootstrap_token = None  # PUBLIC 模式下印在 console 的長效 HOST 進場碼（僅本機使用）
 _batch_watermark = {}  # seat name -> latest human message number successfully handled
 _enabled_seats = []  # persisted AI seats that auto-answer any human message (host or guest)
 _batch_auto_rounds = 0
@@ -161,8 +167,12 @@ def _create_invite(role):
 
 
 def _redeem_invite(token, name):
+    token = (token or "").strip()
+    # HOST 進場碼可重複使用（僅印在本機 console，不經 API 外流），讓操作者掉 cookie 也能重進。
+    if _host_bootstrap_token and token == _host_bootstrap_token:
+        return _new_auth_session("host", name)
     _clean_invites()
-    invite = _invites.pop((token or "").strip(), None)
+    invite = _invites.pop(token, None)
     if not invite:
         return None
     return _new_auth_session(invite["role"], name)
@@ -1068,7 +1078,9 @@ class Handler(BaseHTTPRequestHandler):
             if session:
                 session["last_seen"] = time.time()
                 return session
-            if _is_loopback(self.client_address[0]):
+            # PUBLIC 模式下不能信任來源 IP：Funnel 轉發的公網流量在本機也是 127.0.0.1，
+            # 一律要靠 HOST 進場碼 / 邀請碼，避免任何訪客被自動當成 HOST。
+            if _is_loopback(self.client_address[0]) and not PUBLIC_MODE:
                 sid, session = _new_auth_session("host", "HOST")
                 self._set_cookie = _cookie_header(sid)
                 return session
@@ -1162,18 +1174,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad role"}, 400)
                 return
             token, invite = result
-            host = self.headers.get("Host") or f"127.0.0.1:{PORT}"
-            host_name = host.split(":", 1)[0].lower()
-            if host_name in {"localhost", "127.0.0.1"}:
-                ts_ip = _tailscale_ip()
-                if ts_ip:
-                    host = f"{ts_ip}:{PORT}"
+            if PUBLIC_URL:
+                # 公網 Funnel 網址（https、無 port），讓沒裝 Tailscale 的 guest 也能直接開。
+                url = f"{PUBLIC_URL}/?invite={token}"
+            else:
+                host = self.headers.get("Host") or f"127.0.0.1:{PORT}"
+                host_name = host.split(":", 1)[0].lower()
+                if host_name in {"localhost", "127.0.0.1"}:
+                    ts_ip = _tailscale_ip()
+                    if ts_ip:
+                        host = f"{ts_ip}:{PORT}"
+                url = f"http://{host}/?invite={token}"
             self._json({
                 "ok": True,
                 "role": invite["role"],
                 "token": token,
                 "expires_in": INVITE_TTL_SECONDS,
-                "url": f"http://{host}/?invite={token}",
+                "url": url,
             })
             return
 
@@ -1278,6 +1295,19 @@ def _tailscale_ip():
         return None
 
 
+def _tailscale_funnel_url():
+    # 本機 MagicDNS 名稱即 Funnel 的公開網址（https、443）。用於自動填 guest 邀請連結。
+    try:
+        out = subprocess.run(["tailscale", "status", "--json"], capture_output=True,
+                             text=True, timeout=10)
+        if out.returncode != 0:
+            return None
+        name = ((json.loads(out.stdout or "{}").get("Self") or {}).get("DNSName") or "").rstrip(".")
+        return f"https://{name}" if name else None
+    except Exception:  # noqa: BLE001 - tailscale 沒裝 / 沒開就沒有公開網址
+        return None
+
+
 def _open_browser_later():
     if os.environ.get("AI_ROUNDTABLE_NO_BROWSER") == "1":
         return
@@ -1305,7 +1335,20 @@ def main():
     print(f"ai-roundtable listening on http://127.0.0.1:{PORT}")
     print(f"project_dir: {_project_dir}")
     print(f"session_title: {_session_title()}")
-    _open_browser_later()
+    if PUBLIC_MODE:
+        global _host_bootstrap_token, PUBLIC_URL
+        _host_bootstrap_token = secrets.token_urlsafe(24)
+        if not PUBLIC_URL:  # 未手動指定就從 Tailscale 自動抓公開網址
+            PUBLIC_URL = _tailscale_funnel_url() or ""
+        print("\n[PUBLIC 模式] loopback 自動 HOST 已關閉；公網訪客一律要邀請碼。")
+        print(f"[PUBLIC 模式] HOST 進場連結（僅本機、勿外流）: http://127.0.0.1:{PORT}/?invite={_host_bootstrap_token}")
+        if PUBLIC_URL:
+            print(f"[PUBLIC 模式] guest 邀請連結網址: {PUBLIC_URL}/?invite=<token>")
+        else:
+            print("[PUBLIC 模式] warning: 抓不到 Tailscale 公開網址，"
+                  "請設 AI_ROUNDTABLE_PUBLIC_URL，否則 guest 邀請連結無法從公網開啟", file=sys.stderr)
+    else:
+        _open_browser_later()
     ts_ip = _tailscale_ip()
     if ts_ip:
         try:
