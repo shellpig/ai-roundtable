@@ -1,11 +1,14 @@
 @echo off
-rem 公開 demo 模式（雙擊執行）：關閉 loopback 自動 HOST，公網訪客一律用邀請碼。
-rem 用法：
-rem   1) 先另開一個視窗跑：tailscale funnel 8787   （對外曝露）
-rem   2) 雙擊本檔啟動 server；終端會問專案資料夾 -> 輸入拋棄用的資料夾
-rem   3) 終端印出「HOST 進場連結」(127.0.0.1) 點它進 HOST；
-rem      在 HOST 介面按「邀請」產生 guest 連結（網址會自動抓 Tailscale 公開網址）
-rem   4) demo 完關掉 tailscale funnel：tailscale funnel --bg off
+rem Public demo mode (double-click to run).
+rem   1) Starts Tailscale Funnel in the background (public HTTPS -> 127.0.0.1:8787)
+rem   2) Launches the server in public mode (loopback auto-HOST disabled)
+rem When it asks for the project folder, enter a throwaway folder.
+rem The browser opens to the HOST link automatically; use the "invite" button
+rem to create guest links. Stop the funnel afterwards with stop_demo.cmd.
+echo [demo] Starting Tailscale Funnel (background) on port 8787 ...
+tailscale funnel --bg 8787
+if errorlevel 1 echo [demo] WARNING: funnel failed - check Tailscale is up and Funnel is enabled.
+tailscale funnel status
 set "AI_ROUNDTABLE_PUBLIC=1"
-echo [demo] 公開模式已開啟。請確認已在另一視窗執行 tailscale funnel 8787。
+echo [demo] Public mode ON.
 call "%~dp0start.cmd"

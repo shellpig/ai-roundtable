@@ -1308,15 +1308,16 @@ def _tailscale_funnel_url():
         return None
 
 
-def _open_browser_later():
+def _open_browser_later(url=None):
     if os.environ.get("AI_ROUNDTABLE_NO_BROWSER") == "1":
         return
     if os.name != "nt":
         return
+    target = url or f"http://127.0.0.1:{PORT}/"
 
     def opener():
         try:
-            os.startfile(f"http://127.0.0.1:{PORT}/")  # noqa: S606 - local convenience launcher
+            os.startfile(target)  # noqa: S606 - local convenience launcher
         except OSError:
             pass
 
@@ -1340,13 +1341,15 @@ def main():
         _host_bootstrap_token = secrets.token_urlsafe(24)
         if not PUBLIC_URL:  # 未手動指定就從 Tailscale 自動抓公開網址
             PUBLIC_URL = _tailscale_funnel_url() or ""
+        host_link = f"http://127.0.0.1:{PORT}/?invite={_host_bootstrap_token}"
         print("\n[PUBLIC 模式] loopback 自動 HOST 已關閉；公網訪客一律要邀請碼。")
-        print(f"[PUBLIC 模式] HOST 進場連結（僅本機、勿外流）: http://127.0.0.1:{PORT}/?invite={_host_bootstrap_token}")
+        print(f"[PUBLIC 模式] HOST 進場連結（僅本機、勿外流）: {host_link}")
         if PUBLIC_URL:
             print(f"[PUBLIC 模式] guest 邀請連結網址: {PUBLIC_URL}/?invite=<token>")
         else:
             print("[PUBLIC 模式] warning: 抓不到 Tailscale 公開網址，"
                   "請設 AI_ROUNDTABLE_PUBLIC_URL，否則 guest 邀請連結無法從公網開啟", file=sys.stderr)
+        _open_browser_later(host_link)  # 直接開 HOST 進場連結，省得手動貼
     else:
         _open_browser_later()
     ts_ip = _tailscale_ip()
