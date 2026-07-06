@@ -2,13 +2,16 @@
 # 參與者 = CLI 呼叫配方；逐字稿(jsonl + md 鏡像)是唯一資料層。
 import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).parent
 DATA = ROOT / "data"
@@ -26,6 +29,9 @@ DS_CODEX_HOME = os.environ.get("AI_ROUNDTABLE_DS_CODEX_HOME", str(ROOT / ".codex
 
 PORT = 8787
 CALL_TIMEOUT = 600  # seconds per AI call
+MAX_AUTO_ROUNDS = 2
+INVITE_TTL_SECONDS = 180
+SESSION_COOKIE = "ai_roundtable_session"
 
 # 每席位的可選模型；label 顯示在 UI 與訊息氣泡，其餘欄位由各 adapter 解讀。
 PARTICIPANTS = {
@@ -87,10 +93,79 @@ _selected = {}  # name -> label
 _project_dir = DEFAULT_PROJECT_DIR
 _active_session = {"title": UNNAMED_TITLE, "created_at": None}
 _discussion = {"active": False, "round": 0, "max_rounds": 0}  # 共識討論模式的即時狀態（不持久化）
+_auth_sessions = {}  # session_id -> {"role": "host"|"guest", "name": str, ...}
+_invites = {}  # token -> {"role", "expires_at"}
+_batch_watermark = {}  # seat name -> latest human message number successfully handled
+_enabled_seats = []  # persisted AI seats that auto-answer any human message (host or guest)
+_batch_auto_rounds = 0
+_batch_blocked = False
 
 
 class CallCancelled(Exception):
     pass
+
+
+def _is_loopback(ip):
+    return ip == "::1" or ip.startswith("127.")
+
+
+def _clean_name(name, fallback):
+    name = (name or "").strip()
+    return (name or fallback)[:40]
+
+
+def _new_auth_session(role, name):
+    sid = secrets.token_urlsafe(32)
+    now = time.time()
+    _auth_sessions[sid] = {
+        "role": role,
+        "name": _clean_name(name, "HOST" if role == "host" else "Guest"),
+        "created_at": now,
+        "last_seen": now,
+    }
+    return sid, _auth_sessions[sid]
+
+
+def _cookie_header(sid):
+    return f"{SESSION_COOKIE}={sid}; Path=/; HttpOnly; SameSite=Lax"
+
+
+def _read_cookie_sid(headers):
+    raw = headers.get("Cookie") or ""
+    cookie = SimpleCookie()
+    cookie.load(raw)
+    morsel = cookie.get(SESSION_COOKIE)
+    return morsel.value if morsel else None
+
+
+def _session_payload(session):
+    if not session:
+        return None
+    return {"role": session["role"], "name": session["name"]}
+
+
+def _clean_invites(now=None):
+    now = now or time.time()
+    expired = [token for token, invite in _invites.items() if invite["expires_at"] <= now]
+    for token in expired:
+        _invites.pop(token, None)
+
+
+def _create_invite(role):
+    if role not in {"host", "guest"}:
+        return None
+    _clean_invites()
+    token = secrets.token_urlsafe(24)
+    _invites[token] = {"role": role, "expires_at": time.time() + INVITE_TTL_SECONDS}
+    return token, _invites[token]
+
+
+def _redeem_invite(token, name):
+    _clean_invites()
+    invite = _invites.pop((token or "").strip(), None)
+    if not invite:
+        return None
+    return _new_auth_session(invite["role"], name)
 
 
 def _now():
@@ -122,6 +197,7 @@ def _default_settings():
     return {
         "project_dir": DEFAULT_PROJECT_DIR,
         "participants": DEFAULT_SELECTIONS.copy(),
+        "enabled_seats": _default_enabled_seats(),
         "active_session": {"title": UNNAMED_TITLE, "created_at": _now()},
     }
 
@@ -142,13 +218,15 @@ def _coerce_settings(raw):
         settings["project_dir"] = raw["project_dir"].strip()
     if isinstance(raw.get("participants"), dict):
         settings["participants"].update(raw["participants"])
+    if isinstance(raw.get("enabled_seats"), list):
+        settings["enabled_seats"] = _normalize_seats(raw["enabled_seats"])
     if isinstance(raw.get("active_session"), dict):
         settings["active_session"].update(raw["active_session"])
     return settings
 
 
 def _load_settings():
-    global _project_dir, _active_session
+    global _project_dir, _active_session, _enabled_seats
     settings = _coerce_settings(_read_json(SETTINGS, {}))
     project = settings.get("project_dir") or DEFAULT_PROJECT_DIR
     _project_dir = project if Path(project).is_dir() else DEFAULT_PROJECT_DIR
@@ -158,6 +236,8 @@ def _load_settings():
         saved = settings["participants"].get(name)
         default = DEFAULT_SELECTIONS.get(name, labels[0])
         _selected[name] = saved if saved in labels else default
+
+    _enabled_seats = _normalize_seats(settings.get("enabled_seats"))
 
     active = settings.get("active_session") or {}
     _active_session = {
@@ -171,6 +251,7 @@ def _save_settings():
     payload = {
         "project_dir": _project_dir,
         "participants": {name: _selected[name] for name in PARTICIPANTS},
+        "enabled_seats": list(_enabled_seats),
         "active_session": {
             "title": _active_session.get("title") or UNNAMED_TITLE,
             "created_at": _active_session.get("created_at") or _now(),
@@ -204,12 +285,73 @@ def _title_from_text(text):
     return title[:34] + "..." if len(title) > 34 else title
 
 
+def _message_role(msg):
+    role = msg.get("role")
+    if role in {"host", "guest", "ai", "system"}:
+        return role
+    speaker = msg.get("speaker")
+    if speaker == "你":
+        return "host"
+    if speaker == "system":
+        return "system"
+    if speaker in PARTICIPANTS:
+        return "ai"
+    return "guest"
+
+
+def _message_name(msg):
+    name = (msg.get("name") or "").strip()
+    if name:
+        return name
+    speaker = msg.get("speaker")
+    if speaker in PARTICIPANTS:
+        return PARTICIPANTS[speaker]["display"]
+    if speaker == "你":
+        return "你"
+    return speaker or "unknown"
+
+
+def _is_host_message(msg):
+    return _message_role(msg) == "host"
+
+
+def _is_human_message(msg):
+    return _message_role(msg) in {"host", "guest"}
+
+
+def _latest_human_no():
+    latest = 0
+    for i, msg in enumerate(_messages, 1):
+        if _is_human_message(msg):
+            latest = i
+    return latest
+
+
+def _reset_batch_watermarks():
+    latest = _latest_human_no()
+    _batch_watermark.clear()
+    for name in ADAPTERS:
+        _batch_watermark[name] = latest
+
+
+def _reset_batch_state():
+    # Per-session batch progress only; enabled seats are a persisted preference.
+    global _batch_auto_rounds, _batch_blocked
+    _batch_auto_rounds = 0
+    _batch_blocked = False
+    _reset_batch_watermarks()
+
+
+def _human_range_label(start_no, end_no):
+    return f"[{start_no}]" if start_no == end_no else f"[{start_no}-{end_no}]"
+
+
 def _archive_title():
     title = _session_title()
     if title != UNNAMED_TITLE:
         return title
     for msg in _messages:
-        if msg.get("speaker") == "你":
+        if _is_host_message(msg):
             return _title_from_text(msg.get("text"))
     return UNNAMED_TITLE
 
@@ -228,13 +370,13 @@ def _load():
             line = line.strip()
             if line:
                 _messages.append(json.loads(line))
+    _reset_batch_state()
 
 
 def _rebuild_md():
     parts = ["# 圓桌會議逐字稿", ""]
     for i, m in enumerate(_messages, 1):
-        who = m["speaker"]
-        disp = PARTICIPANTS.get(who, {}).get("display", who)
+        disp = _message_name(m)
         parts.append(f"## [{i}] {disp}")
         parts.append("")
         parts.append(m["text"])
@@ -260,6 +402,7 @@ def _archive_active_session(reset_title=True):
         if reset_title:
             _active_session = {"title": UNNAMED_TITLE, "created_at": _now()}
             _save_settings()
+        _reset_batch_state()
         return None
 
     sid, archived_transcript, archived_mirror = _unique_archive_paths(_stamp())
@@ -290,6 +433,7 @@ def _archive_active_session(reset_title=True):
     sessions.append(entry)
     _save_sessions(sessions)
     _messages.clear()
+    _reset_batch_state()
     if reset_title:
         _active_session = {"title": UNNAMED_TITLE, "created_at": _now()}
     _save_settings()
@@ -316,12 +460,14 @@ def _restore_session(entry):
     _load()
 
 
-def append_message(speaker, text, sub=None):
+def append_message(speaker, text, sub=None, role=None, name=None):
     msg = {"speaker": speaker, "text": text.strip(), "ts": _now()}
+    msg["role"] = role or _message_role(msg)
+    msg["name"] = _clean_name(name, _message_name(msg))
     if sub:
         msg["sub"] = sub
     with _lock:
-        if not _messages and speaker == "你" and _session_title() == UNNAMED_TITLE:
+        if not _messages and _is_host_message(msg) and _session_title() == UNNAMED_TITLE:
             _active_session["title"] = _title_from_text(text)
             _save_settings()
         _messages.append(msg)
@@ -438,6 +584,22 @@ def _run_process(name, args, *, input_text=None, stdin=None, cwd=None, env=None,
             raise CallCancelled()
 
 
+
+
+def _batch_instruction(name, start_no, end_no):
+    disp = PARTICIPANTS[name]["display"]
+    return (
+        f"You are the AI roundtable participant named {disp}.\n"
+        f"1. Read the full UTF-8 transcript first: {MD_MIRROR}.\n"
+        f"2. The discussion usually concerns this project directory: {_project_dir}. Inspect it read-only if needed.\n"
+        f"3. For this batch, handle only human messages in transcript number range {_human_range_label(start_no, end_no)}. "
+        f"AI and system messages inside that range are context only.\n"
+        f"4. Reply in Traditional Chinese. For each human message that needs an answer, start the section with: "
+        f"Reply name[number]: . If a human message needs no answer, write: Skip name[number]: reason.\n"
+        f"5. You may answer multiple humans in one output. Be concise. Never create, modify, or delete files."
+    )
+
+
 def _call_codex(name, instr, opt, env_extra=None):
     env = os.environ.copy()
     if env_extra:
@@ -504,18 +666,24 @@ ADAPTERS = {
 }
 
 
-def _worker(name, phase=None):
+def _worker(name, phase=None, batch_start=None, batch_target=None):
     opt = _option(name)
     try:
-        text = ADAPTERS[name](name, _instruction(name, phase), opt)
+        instr = _batch_instruction(name, batch_start, batch_target) if batch_target else _instruction(name, phase)
+        text = ADAPTERS[name](name, instr, opt)
         append_message(name, text, sub=opt["label"])
+        if batch_target:
+            with _lock:
+                _batch_watermark[name] = max(_batch_watermark.get(name, 0), batch_target)
     except CallCancelled:
-        append_message("system", f"⚠ {PARTICIPANTS[name]['display']}（{opt['label']}）已由使用者取消本次呼叫")
-    except Exception as e:  # noqa: BLE001 - 任何失敗都要回報進聊天室
-        append_message("system", f"⚠ {PARTICIPANTS[name]['display']}（{opt['label']}）呼叫失敗：{e}")
+        append_message("system", f"? {PARTICIPANTS[name]['display']}?{opt['label']}????????????")
+    except Exception as e:  # noqa: BLE001 - ????????????
+        append_message("system", f"? {PARTICIPANTS[name]['display']}?{opt['label']}??????{e}")
     finally:
         with _lock:
             _busy.pop(name, None)
+        if batch_target:
+            _maybe_start_auto_batch()
 
 
 def ask(names, phase=None):
@@ -530,6 +698,98 @@ def ask(names, phase=None):
         threading.Thread(target=_worker, args=(name, phase), daemon=True).start()
         started.append(name)
     return started
+
+
+def _default_enabled_seats():
+    return [name for name in PARTICIPANTS if name in ADAPTERS]
+
+
+def _normalize_seats(names):
+    # Keep canonical PARTICIPANTS order, drop unknown/duplicate seats.
+    wanted = {name for name in (names or []) if name in ADAPTERS}
+    return [name for name in PARTICIPANTS if name in wanted]
+
+
+def _set_enabled_seats(names):
+    global _enabled_seats
+    _enabled_seats = _normalize_seats(names)
+    _save_settings()
+
+
+def _valid_batch_names(names):
+    seen = set()
+    valid = []
+    for name in names or []:
+        if name in ADAPTERS and name not in seen:
+            valid.append(name)
+            seen.add(name)
+    return valid
+
+
+def _prepare_batch(names=None, *, auto=False, reset_auto=False):
+    global _batch_auto_rounds, _batch_blocked
+    notice = None
+    with _lock:
+        if _discussion["active"] or _busy:
+            return [], None
+        # names is None -> keep the persisted enabled seats (guest/auto path);
+        # names given (HOST) -> that selection becomes the new persisted set.
+        if names is not None:
+            _set_enabled_seats(names)
+        if reset_auto:
+            _batch_auto_rounds = 0
+            _batch_blocked = False
+        if not _enabled_seats or (_batch_blocked and not reset_auto):
+            return [], None
+        target = _latest_human_no()
+        if target <= 0:
+            return [], None
+        pending = []
+        for name in _enabled_seats:
+            start_no = _batch_watermark.get(name, 0) + 1
+            if target >= start_no:
+                pending.append((name, start_no, target))
+        if not pending:
+            return [], None
+        if auto:
+            if _batch_auto_rounds >= MAX_AUTO_ROUNDS:
+                _batch_blocked = True
+                notice = (
+                    f"Pending human messages up to [{target}] were not processed because "
+                    f"the auto-batch limit ({MAX_AUTO_ROUNDS}) was reached. HOST must send a message or ask AI again to continue."
+                )
+                return [], notice
+            _batch_auto_rounds += 1
+        for name, _, _ in pending:
+            _busy[name] = time.time()
+        return pending, None
+
+
+def _launch_batch(pending):
+    started = []
+    for name, start_no, target in pending:
+        threading.Thread(
+            target=_worker,
+            args=(name, None, start_no, target),
+            daemon=True,
+        ).start()
+        started.append(name)
+    return started
+
+
+def start_batch(names=None, *, reset_auto=False):
+    pending, notice = _prepare_batch(names, auto=False, reset_auto=reset_auto)
+    if notice:
+        append_message("system", notice)
+    return _launch_batch(pending)
+
+
+def _maybe_start_auto_batch():
+    pending, notice = _prepare_batch(auto=True, reset_auto=False)
+    if notice:
+        append_message("system", notice)
+        return []
+    return _launch_batch(pending)
 
 
 def cancel_call(name):
@@ -584,7 +844,7 @@ def _wait_busy_clear(names):
 
 def _host_interrupted(baseline):
     with _lock:
-        return any(m.get("speaker") == "你" for m in _messages[baseline:])
+        return any(_is_host_message(m) for m in _messages[baseline:])
 
 
 def _run_seat_sync(name, phase):
@@ -692,6 +952,22 @@ def _sessions_for_project(project_dir):
     return sorted(items, key=lambda s: s.get("archived_at", ""), reverse=True)
 
 
+def _active_message_count():
+    if _messages:
+        return len(_messages)
+    if not TRANSCRIPT.exists():
+        return 0
+    return sum(1 for line in TRANSCRIPT.read_text(encoding="utf-8").splitlines() if line.strip())
+
+
+def _print_active_session():
+    print("\n\u76ee\u524d\u6703\u8b70\uff08\u76f4\u63a5 Enter \u6703\u6cbf\u7528\u9019\u500b\uff09:")
+    created = (_active_session.get("created_at") or "")[:16]
+    title = _session_title()
+    count = _active_message_count()
+    print(f"[*] {created or 'active'}  {count} messages  {title}")
+
+
 def _rename_session(session_id, title):
     sessions = _load_sessions()
     for s in sessions:
@@ -727,6 +1003,7 @@ def _prompt_project_dir():
 
 
 def _print_session_menu(items):
+    _print_active_session()
     print("\n找到此專案的歸檔會議:")
     for i, s in enumerate(items, 1):
         when = s.get("archived_at", "")[:16]
@@ -744,7 +1021,7 @@ def _prompt_restore_session():
             return
         _print_session_menu(items)
         try:
-            choice = input("\n輸入編號恢復，輸入 r 編號重新命名，或直接 Enter 開新會議:\n> ").strip()
+            choice = input("\n\u8f38\u5165\u7de8\u865f\u6062\u5fa9\uff0c\u8f38\u5165 r \u7de8\u865f\u91cd\u65b0\u547d\u540d\uff0c\u6216\u76f4\u63a5 Enter \u6cbf\u7528\u76ee\u524d\u6703\u8b70:\n> ").strip()
         except EOFError:
             return
         if not choice:
@@ -777,22 +1054,69 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        cookie = getattr(self, "_set_cookie", None)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+            self._set_cookie = None
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _current_session(self):
+        sid = _read_cookie_sid(self.headers)
+        with _lock:
+            session = _auth_sessions.get(sid) if sid else None
+            if session:
+                session["last_seen"] = time.time()
+                return session
+            if _is_loopback(self.client_address[0]):
+                sid, session = _new_auth_session("host", "HOST")
+                self._set_cookie = _cookie_header(sid)
+                return session
+        return None
+
+    def _require_session(self):
+        session = self._current_session()
+        if not session:
+            self._json({"error": "unauthorized"}, 401)
+            return None
+        return session
+
+    def _require_host(self):
+        session = self._require_session()
+        if not session:
+            return None
+        if session.get("role") != "host":
+            self._json({"error": "host required"}, 403)
+            return None
+        return session
+
+    def _send_index(self):
+        self._current_session()
+        body = (ROOT / "index.html").read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        cookie = getattr(self, "_set_cookie", None)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+            self._set_cookie = None
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/" or self.path.startswith("/index"):
-            body = (ROOT / "index.html").read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif self.path.startswith("/api/state"):
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        if path == "/" or path.startswith("/index"):
+            self._send_index()
+        elif path == "/api/state":
+            session = self._require_session()
+            if not session:
+                return
             since = 0
-            if "since=" in self.path:
+            values = parse_qs(parsed.query).get("since")
+            if values:
                 try:
-                    since = int(self.path.split("since=")[1].split("&")[0])
+                    since = int(values[0])
                 except ValueError:
                     since = 0
             with _lock:
@@ -801,9 +1125,11 @@ class Handler(BaseHTTPRequestHandler):
                     "messages": _messages[since:],
                     "busy": sorted(_busy.keys()),
                     "participants": _participants_payload(),
+                    "enabled_seats": list(_enabled_seats),
                     "project_dir": _project_dir,
                     "session_title": _session_title(),
                     "discussion": dict(_discussion),
+                    "session": _session_payload(session),
                 })
         else:
             self._json({"error": "not found"}, 404)
@@ -815,36 +1141,99 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self._json({"error": "bad json"}, 400)
             return
+
+        if self.path == "/api/token/verify":
+            result = _redeem_invite(payload.get("token"), payload.get("name"))
+            if not result:
+                self._json({"error": "invalid or expired token"}, 401)
+                return
+            sid, session = result
+            self._set_cookie = _cookie_header(sid)
+            self._json({"ok": True, "session": _session_payload(session)})
+            return
+
+        if self.path == "/api/token/generate":
+            session = self._require_host()
+            if not session:
+                return
+            role = payload.get("role") or "guest"
+            result = _create_invite(role)
+            if not result:
+                self._json({"error": "bad role"}, 400)
+                return
+            token, invite = result
+            host = self.headers.get("Host") or f"127.0.0.1:{PORT}"
+            host_name = host.split(":", 1)[0].lower()
+            if host_name in {"localhost", "127.0.0.1"}:
+                ts_ip = _tailscale_ip()
+                if ts_ip:
+                    host = f"{ts_ip}:{PORT}"
+            self._json({
+                "ok": True,
+                "role": invite["role"],
+                "token": token,
+                "expires_in": INVITE_TTL_SECONDS,
+                "url": f"http://{host}/?invite={token}",
+            })
+            return
+
+        session = self._require_session()
+        if not session:
+            return
+
         if self.path == "/api/send":
             text = (payload.get("text") or "").strip()
-            speaker = payload.get("speaker") or "你"
+            role = session.get("role")
+            name = session.get("name", "HOST" if role == "host" else "Guest")
+            speaker = "你" if role == "host" else name
             with _lock:
                 discussing = _discussion["active"]
             if discussing:
-                # 討論進行中：發言視為插話寫入，run_discussion 會偵測並中止；不另外觸發呼叫
+                if role != "host":
+                    self._json({"error": "host required"}, 403)
+                    return
+                # Discussion is active: host messages interrupt it without starting another call.
                 if text:
-                    append_message(speaker, text)
+                    append_message(speaker, text, role=role, name=name)
                 self._json({"ok": True, "interrupted": True})
             elif payload.get("mode") == "discussion":
+                if role != "host":
+                    self._json({"error": "host required"}, 403)
+                    return
                 if text:
-                    append_message(speaker, text)
+                    append_message(speaker, text, role=role, name=name)
                 names = payload.get("ask") or []
                 self._json({"ok": True, "discussion": start_discussion(names, payload.get("max_rounds", 3))})
             else:
                 if text:
-                    append_message(speaker, text)
-                started = ask(payload.get("ask") or [])
+                    append_message(speaker, text, role=role, name=name)
+                # HOST發言帶著席位選擇（更新持久化 enabled seats）；
+                # guest 傳 None，沿用目前已啟用的席位自動回覆。
+                names = (payload.get("ask") or []) if role == "host" else None
+                started = start_batch(names, reset_auto=(role == "host"))
                 self._json({"ok": True, "started": started})
         elif self.path == "/api/ask":
-            self._json({"ok": True, "started": ask(payload.get("names") or [])})
+            if session.get("role") != "host":
+                self._json({"error": "host required"}, 403)
+                return
+            self._json({"ok": True, "started": start_batch(payload.get("names"), reset_auto=True)})
         elif self.path == "/api/cancel":
+            if session.get("role") != "host":
+                self._json({"error": "host required"}, 403)
+                return
             self._json({"ok": True, "cancelled": cancel_call(payload.get("name"))})
         elif self.path == "/api/title":
+            if session.get("role") != "host":
+                self._json({"error": "host required"}, 403)
+                return
             title = (payload.get("title") or "").strip() or UNNAMED_TITLE
             with _lock:
                 _set_session_title(title)
             self._json({"ok": True, "title": _session_title()})
         elif self.path == "/api/config":
+            if session.get("role") != "host":
+                self._json({"error": "host required"}, 403)
+                return
             name = payload.get("name")
             label = payload.get("label")
             if name in PARTICIPANTS and label in [m["label"] for m in PARTICIPANTS[name]["models"]]:
@@ -854,7 +1243,24 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True})
             else:
                 self._json({"error": "bad name/label"}, 400)
+        elif self.path == "/api/enabled":
+            if session.get("role") != "host":
+                self._json({"error": "host required"}, 403)
+                return
+            name = payload.get("name")
+            if name not in PARTICIPANTS:
+                self._json({"error": "bad name"}, 400)
+                return
+            with _lock:
+                seats = set(_enabled_seats)
+                seats.add(name) if payload.get("on") else seats.discard(name)
+                _set_enabled_seats(seats)
+                enabled = list(_enabled_seats)
+            self._json({"ok": True, "enabled_seats": enabled})
         elif self.path == "/api/new":
+            if session.get("role") != "host":
+                self._json({"error": "host required"}, 403)
+                return
             with _lock:
                 archived = _archive_active_session()
             self._json({"ok": True, "archived": archived, "session_title": _session_title()})

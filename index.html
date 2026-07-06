@@ -52,9 +52,11 @@
     border-radius: 8px; font-size: 12px; padding: 3px 4px; max-width: 190px;
   }
   .mselect:focus { outline: none; border-color: #4c8bf5; }
-  #newBtn { margin-left: auto; background: none; border: 1px solid var(--line);
+  #inviteBtn { margin-left: auto; }
+  #inviteBtn, #newBtn { background: none; border: 1px solid var(--line);
     color: var(--dim); border-radius: 8px; padding: 4px 10px; cursor: pointer; }
-  #newBtn:hover { color: var(--text); }
+  #inviteBtn:hover, #newBtn:hover { color: var(--text); }
+  #inviteBtn:disabled, #newBtn:disabled { opacity: .45; cursor: default; }
   main { flex: 1; overflow-y: auto; padding: 18px 0 8px; }
   .row { max-width: 860px; margin: 0 auto 14px; padding: 0 16px; display: flex; }
   .bubble {
@@ -100,6 +102,25 @@
     max-width: 860px; margin: 0 auto 10px; padding: 6px 12px; font-size: 13px;
     border: 1px solid #3c5677; border-radius: 8px; background: rgba(47,111,218,.12); color: var(--text);
   }
+  #authGate {
+    position: fixed; inset: 0; z-index: 20; background: rgba(16,20,24,.96);
+    display: none; align-items: center; justify-content: center; padding: 20px;
+  }
+  #authGate.show { display: flex; }
+  .auth-box {
+    width: min(420px, 100%); border: 1px solid var(--line); border-radius: 10px;
+    background: var(--panel); padding: 18px; box-shadow: 0 20px 60px rgba(0,0,0,.35);
+  }
+  .auth-box h2 { margin: 0 0 12px; font-size: 16px; }
+  .auth-box input {
+    width: 100%; margin: 6px 0; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font: inherit;
+  }
+  .auth-box button {
+    width: 100%; margin-top: 8px; background: #2f6fda; color: #fff; border: none;
+    border-radius: 8px; padding: 8px 10px; font: inherit; cursor: pointer;
+  }
+  .auth-msg { min-height: 20px; color: #e6a0a7; font-size: 12px; margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -107,8 +128,18 @@
   <h1>AI 圓桌</h1>
   <span id="sessionTitle" title="點擊修改會議名稱">未命名會議</span>
   <span id="chips"></span>
+  <button id="inviteBtn" title="產生 3 分鐘有效的一次性邀請碼" style="display:none">邀請</button>
   <button id="newBtn" title="歸檔目前逐字稿並開新會議">🧹 新會議</button>
 </header>
+<div id="authGate">
+  <div class="auth-box">
+    <h2>加入 AI 圓桌</h2>
+    <input id="authName" maxlength="40" placeholder="你的暱稱">
+    <input id="authToken" placeholder="邀請碼">
+    <button id="authBtn" type="button">加入</button>
+    <div id="authMsg" class="auth-msg"></div>
+  </div>
+</div>
 <main id="log"></main>
 <footer>
   <div id="discussBar" class="discuss-bar" style="display:none"></div>
@@ -123,12 +154,87 @@
   </div>
 </footer>
 <script>
-const state = { total: 0, participants: {}, enabled: {}, busy: [], sessionTitle: '未命名會議' };
+const state = { total: 0, participants: {}, enabled: {}, busy: [], sessionTitle: '未命名會議', session: null };
+let enableInflight = 0; // >0 時暫停用伺服器值覆蓋本地樂觀切換
 const $ = id => document.getElementById(id);
 let editingTitle = false;
 
 function esc(s) {
   return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function isHost() {
+  return state.session && state.session.role === 'host';
+}
+
+function setAuthVisible(visible) {
+  $('authGate').className = visible ? 'show' : '';
+}
+
+function updateRoleUi() {
+  const host = isHost();
+  $('inviteBtn').style.display = host ? '' : 'none';
+  $('newBtn').disabled = !host;
+  $('sessionTitle').style.cursor = host ? 'pointer' : 'default';
+  $('hintText').innerHTML = host
+    ? '送出後會自動徵詢所有<b>已啟用</b>的參與者；點上方名字可把 AI 拉進 / 移出圓桌。'
+    : 'Guest 發言會寫入逐字稿並自動徵詢目前已啟用的 AI 席位；模型切換、席位增減與會議控制由 HOST 操作。';
+  $('consensusMode').disabled = !host;
+  if (!host) $('consensusMode').checked = false;
+  $('roundsWrap').style.display = host && $('consensusMode').checked ? '' : 'none';
+  updateChips();
+}
+
+async function verifyInvite() {
+  const name = $('authName').value.trim();
+  const token = $('authToken').value.trim();
+  $('authMsg').textContent = '';
+  if (!name || !token) {
+    $('authMsg').textContent = '請輸入暱稱與邀請碼';
+    return;
+  }
+  const r = await fetch('/api/token/verify', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, token })
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    $('authMsg').textContent = j.error || '邀請碼無效或已過期';
+    return;
+  }
+  state.session = j.session;
+  setAuthVisible(false);
+  await poll();
+}
+
+function applyInviteFromUrl() {
+  const params = new URLSearchParams(location.search);
+  const invite = params.get('invite');
+  if (invite) {
+    $('authToken').value = invite;
+    history.replaceState(null, '', location.pathname);
+  }
+}
+
+async function generateInvite() {
+  const role = confirm('按「確定」產生 HOST 邀請碼；按「取消」產生 GUEST 邀請碼。') ? 'host' : 'guest';
+  if (role === 'host' && !confirm('HOST 可以改模型、開新會議、取消 AI 呼叫。確定要產生 HOST 碼？')) return;
+  const r = await fetch('/api/token/generate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role })
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    alert(j.error || '邀請碼產生失敗');
+    return;
+  }
+  const msg = `${j.role.toUpperCase()} 邀請碼，${j.expires_in} 秒內有效，一次性使用：\n\n${j.token}\n\n連結：\n${j.url}`;
+  try {
+    await navigator.clipboard.writeText(j.url);
+    alert(`${msg}\n\n已複製連結。`);
+  } catch (e) {
+    prompt('複製邀請連結', j.url);
+  }
 }
 
 function renderSessionTitle() {
@@ -139,7 +245,7 @@ function renderSessionTitle() {
 }
 
 function startTitleEdit() {
-  if (editingTitle) return;
+  if (editingTitle || !isHost()) return;
   editingTitle = true;
   const current = state.sessionTitle || '未命名會議';
   const el = $('sessionTitle');
@@ -188,6 +294,8 @@ async function saveTitle(value) {
 }
 
 $('sessionTitle').onclick = startTitleEdit;
+$('authBtn').onclick = verifyInvite;
+$('inviteBtn').onclick = generateInvite;
 
 const seats = {}; // name -> { chip, sel }；只建一次，之後原地更新，避免輪詢重建把展開中的選單關掉
 
@@ -200,7 +308,21 @@ function buildChips() {
     const c = document.createElement('span');
     c.innerHTML = `<span class="dot"></span>${esc(p.display)}`;
     c.title = '點擊拉進 / 移出圓桌';
-    c.onclick = () => { state.enabled[name] = !state.enabled[name]; updateChips(); };
+    c.onclick = async () => {
+      if (!isHost()) return;
+      const on = !state.enabled[name];
+      state.enabled[name] = on; // 樂觀更新
+      updateChips();
+      enableInflight++;
+      try {
+        const r = await fetch('/api/enabled', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, on })
+        });
+        if (!r.ok) { state.enabled[name] = !on; updateChips(); }
+      } catch (e) { state.enabled[name] = !on; updateChips(); }
+      finally { enableInflight--; }
+    };
     seat.appendChild(c);
     const sel = document.createElement('select');
     sel.className = 'mselect';
@@ -212,6 +334,7 @@ function buildChips() {
     }
     sel.value = p.selected;
     sel.onchange = async () => {
+      if (!isHost()) return;
       const label = sel.value;
       state.participants[name].selected = label; // 樂觀更新，防止下一輪 poll 蓋回舊值
       const r = await fetch('/api/config', {
@@ -233,18 +356,36 @@ function updateChips() {
     if (!s) continue;
     s.chip.className = 'chip' + (state.enabled[name] ? ' on' : '') + (state.busy.includes(name) ? ' busy' : '');
     s.chip.style.color = state.enabled[name] ? p.color : '';
+    s.chip.style.cursor = isHost() ? 'pointer' : 'default';
+    s.sel.disabled = !isHost();
     // 使用者正在操作的選單絕不去動；其餘情況才同步伺服器端的選擇
     if (document.activeElement !== s.sel && s.sel.value !== p.selected) s.sel.value = p.selected;
   }
 }
 
+function messageRole(m) {
+  if (['host', 'guest', 'ai', 'system'].includes(m.role)) return m.role;
+  if (m.speaker === '你') return 'host';
+  if (m.speaker === 'system') return 'system';
+  if (state.participants[m.speaker]) return 'ai';
+  return 'guest';
+}
+
+function messageName(m) {
+  if (m.name) return m.name;
+  const p = state.participants[m.speaker];
+  if (p) return p.display;
+  return m.speaker || 'unknown';
+}
+
 function addBubble(m, number) {
   const p = state.participants[m.speaker];
+  const role = messageRole(m);
   const row = document.createElement('div');
-  const isMe = m.speaker === '你';
-  row.className = 'row' + (isMe ? ' me' : '') + (m.speaker === 'system' ? ' sys' : '');
+  const isMe = role === 'host';
+  row.className = 'row' + (isMe ? ' me' : '') + (role === 'system' ? ' sys' : '');
   const color = p ? p.color : (isMe ? '#9fc1ea' : '#8fa0af');
-  const label = p ? p.display : m.speaker;
+  const label = messageName(m);
   const sub = m.sub ? `<span class="sub">${esc(m.sub)}</span>` : '';
   row.innerHTML = `<div class="bubble"><div class="who" style="color:${color}"><span class="msgno">[${number}]</span>${esc(label)}${sub}<span class="ts">${esc(m.ts || '')}</span></div>${esc(m.text)}</div>`;
   $('log').appendChild(row);
@@ -274,13 +415,19 @@ async function cancelCall(name, button) {
 async function poll() {
   try {
     const r = await fetch(`/api/state?since=${state.total}`);
+    if (r.status === 401) { setAuthVisible(true); return; }
     const j = await r.json();
+    state.session = j.session || state.session;
+    setAuthVisible(false);
     state.participants = j.participants;
     state.sessionTitle = j.session_title || '未命名會議';
+    updateRoleUi();
     renderSessionTitle();
     renderDiscussBar(j.discussion);
-    if (Object.keys(state.enabled).length === 0) {
-      for (const [n, p] of Object.entries(j.participants)) if (!p.manual) state.enabled[n] = true;
+    if (enableInflight === 0) {
+      // enabled seats 以伺服器為準（持久化、有預設值）
+      state.enabled = {};
+      for (const n of (j.enabled_seats || [])) state.enabled[n] = true;
     }
     const nearBottom = $('log').scrollHeight - $('log').scrollTop - $('log').clientHeight < 80;
     if (j.total < state.total) { $('log').innerHTML = ''; state.total = 0; return poll(); }
@@ -297,9 +444,9 @@ async function poll() {
 async function send() {
   const text = $('input').value.trim();
   if (!text) return;
-  const ask = Object.entries(state.enabled).filter(([, v]) => v).map(([k]) => k);
+  const ask = isHost() ? Object.entries(state.enabled).filter(([, v]) => v).map(([k]) => k) : [];
   const body = { text, ask };
-  if ($('consensusMode').checked) {
+  if (isHost() && $('consensusMode').checked) {
     body.mode = 'discussion';
     body.max_rounds = Math.max(2, Math.min(8, parseInt($('maxRounds').value, 10) || 3));
   }
@@ -315,7 +462,7 @@ async function send() {
 }
 
 $('consensusMode').onchange = () => {
-  $('roundsWrap').style.display = $('consensusMode').checked ? '' : 'none';
+  $('roundsWrap').style.display = isHost() && $('consensusMode').checked ? '' : 'none';
 };
 
 function renderDiscussBar(d) {
@@ -344,6 +491,7 @@ $('newBtn').onclick = async () => {
   renderSessionTitle();
 };
 
+applyInviteFromUrl();
 poll();
 setInterval(poll, 1500);
 </script>
