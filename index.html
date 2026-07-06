@@ -64,6 +64,7 @@
   .row.me { justify-content: flex-end; }
   .row.me .bubble { background: var(--me); border-color: #3c5677; }
   .who { font-size: 12px; font-weight: bold; margin-bottom: 4px; }
+  .who .msgno { font-weight: normal; color: var(--dim); margin-right: 6px; }
   .who .sub { font-weight: normal; color: var(--dim); margin-left: 6px; font-size: 11px; }
   .who .ts { font-weight: normal; color: var(--dim); margin-left: 8px; font-size: 11px; }
   .row.sys .bubble { border-style: dashed; color: var(--dim); font-size: 13px; }
@@ -237,7 +238,7 @@ function updateChips() {
   }
 }
 
-function addBubble(m) {
+function addBubble(m, number) {
   const p = state.participants[m.speaker];
   const row = document.createElement('div');
   const isMe = m.speaker === '你';
@@ -245,7 +246,7 @@ function addBubble(m) {
   const color = p ? p.color : (isMe ? '#9fc1ea' : '#8fa0af');
   const label = p ? p.display : m.speaker;
   const sub = m.sub ? `<span class="sub">${esc(m.sub)}</span>` : '';
-  row.innerHTML = `<div class="bubble"><div class="who" style="color:${color}">${esc(label)}${sub}<span class="ts">${esc(m.ts || '')}</span></div>${esc(m.text)}</div>`;
+  row.innerHTML = `<div class="bubble"><div class="who" style="color:${color}"><span class="msgno">[${number}]</span>${esc(label)}${sub}<span class="ts">${esc(m.ts || '')}</span></div>${esc(m.text)}</div>`;
   $('log').appendChild(row);
 }
 
@@ -283,7 +284,8 @@ async function poll() {
     }
     const nearBottom = $('log').scrollHeight - $('log').scrollTop - $('log').clientHeight < 80;
     if (j.total < state.total) { $('log').innerHTML = ''; state.total = 0; return poll(); }
-    j.messages.forEach(addBubble);
+    const base = state.total;
+    j.messages.forEach((m, i) => addBubble(m, base + i + 1));
     state.total = j.total;
     state.busy = j.busy;
     if (Object.keys(seats).length === 0) buildChips(); else updateChips();

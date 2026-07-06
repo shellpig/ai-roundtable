@@ -1,5 +1,7 @@
 # ai-roundtable
 
+**English** | [繁體中文](./README_zh-TW.md) | [简体中文](./README_zh-CN.md)
+
 ![Python](https://img.shields.io/badge/PYTHON-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/PLATFORM-WINDOWS-0078D6?logo=windows&logoColor=white)
 ![UI](https://img.shields.io/badge/UI-LOCALHOST-10a37f)
