@@ -662,8 +662,12 @@ def _call_claude(name, instr, opt):
     exe = _find_claude()
     if not exe:
         raise RuntimeError("找不到 claude.exe（桌面 app 的 claude-code 資料夾不存在？）")
+    # 僅允許唯讀的本機檢視工具。刻意排除 WebSearch/WebFetch：若 Claude 席位遭
+    # prompt injection，這兩個工具可把本機專案內容外洩到攻擊者控制的網址；此席位
+    # 的工作只需唯讀檢視本機專案，不需要網路存取（尤其此工具可經 Tailscale Funnel
+    # 公開曝露）。
     args = [exe, "-p", instr, "--model", opt["model"],
-            "--allowedTools", "Read,Glob,Grep,WebSearch,WebFetch", "--add-dir", str(DATA)]
+            "--allowedTools", "Read,Glob,Grep", "--add-dir", str(DATA)]
     if opt.get("effort"):
         args += ["--effort", opt["effort"]]
     proc = _run_process(name, args, cwd=_project_dir, stdin=subprocess.DEVNULL, timeout=CALL_TIMEOUT)
