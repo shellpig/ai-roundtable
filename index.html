@@ -417,7 +417,7 @@ function addBubble(m, number) {
   const p = state.participants[m.speaker];
   const role = messageRole(m);
   const row = document.createElement('div');
-  const isMe = role === 'host';
+  const isMe = role === 'host' || role === 'guest';
   row.className = 'row' + (isMe ? ' me' : '') + (role === 'system' ? ' sys' : '');
   const color = p ? p.color : (isMe ? '#9fc1ea' : '#8fa0af');
   const label = messageName(m);
