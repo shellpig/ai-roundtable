@@ -641,10 +641,15 @@ def _call_codex(name, instr, opt, env_extra=None):
 
 
 def _call_agy(name, instr, opt):
+    # 不使用 --dangerously-skip-permissions（會讓 agy 取得主機完全存取權，且會讓
+    # --sandbox 失效）。改用 --sandbox：agy 目前沒有真正的唯讀/plan 模式可用於
+    # 非互動 -p 執行（上游尚未支援，見 google-antigravity/antigravity-cli#45），
+    # --sandbox 僅限制 shell/終端機工具，無法阻擋檔案寫入類工具──這是目前 agy
+    # 所能提供的最大限制，並非完整唯讀保證。
     args = [
         AGY_EXE, "-p", instr, "--model", opt["model"],
         "--add-dir", _project_dir, "--add-dir", str(DATA),
-        "--dangerously-skip-permissions", "--print-timeout", f"{CALL_TIMEOUT - 60}s",
+        "--sandbox", "--print-timeout", f"{CALL_TIMEOUT - 60}s",
     ]
     proc = _run_process(name, args, stdin=subprocess.DEVNULL, timeout=CALL_TIMEOUT)
     result = (proc.stdout or "").strip()
