@@ -53,10 +53,12 @@
   }
   .mselect:focus { outline: none; border-color: #4c8bf5; }
   #inviteBtn { margin-left: auto; }
-  #inviteBtn, #newBtn { background: none; border: 1px solid var(--line);
+  #inviteBtn, #newBtn, #fullOutputBtn { background: none; border: 1px solid var(--line);
     color: var(--dim); border-radius: 8px; padding: 4px 10px; cursor: pointer; }
-  #inviteBtn:hover, #newBtn:hover { color: var(--text); }
+  #inviteBtn:hover, #newBtn:hover, #fullOutputBtn:hover { color: var(--text); }
   #inviteBtn:disabled, #newBtn:disabled { opacity: .45; cursor: default; }
+  #fullOutputBtn.on { color: #fff; border-color: #4c8bf5; }
+  .bubble.skip-only { color: var(--dim); font-style: italic; }
   main { flex: 1; overflow-y: auto; padding: 18px 0 8px; }
   .row { max-width: 860px; margin: 0 auto 14px; padding: 0 16px; display: flex; }
   .bubble {
@@ -129,6 +131,7 @@
   <span id="sessionTitle" title="點擊修改會議名稱">未命名會議</span>
   <span id="chips"></span>
   <button id="inviteBtn" title="產生 3 分鐘有效的一次性邀請碼" style="display:none">邀請</button>
+  <button id="fullOutputBtn" title="切換是否顯示 AI 完整輸出（含非回覆內容）">顯示完整輸出</button>
   <button id="newBtn" title="歸檔目前逐字稿並開新會議">🧹 新會議</button>
 </header>
 <div id="authGate">
@@ -158,9 +161,41 @@ const state = { total: 0, participants: {}, enabled: {}, busy: [], sessionTitle:
 let enableInflight = 0; // >0 時暫停用伺服器值覆蓋本地樂觀切換
 const $ = id => document.getElementById(id);
 let editingTitle = false;
+let showFullOutput = localStorage.getItem('ai_roundtable_show_full') === '1';
 
 function esc(s) {
   return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+const MARK_RE = /^\s*(\*\*)?(Reply|Skip)\s+\S.*?\[\d+\](\*\*)?\s*[:：]/;
+
+// 從 AI 全文中只抽出 Reply 段落；沒有任何 Reply/Skip 標記時回傳原文（共識討論等自由格式）。
+// 只有 Skip、沒有 Reply 時回傳空字串，呼叫端顯示佔位文字。
+function extractReplies(text) {
+  const src = String(text || '');
+  const lines = src.split('\n');
+  const marks = [];
+  lines.forEach((line, i) => {
+    const mm = line.match(MARK_RE);
+    if (mm) marks.push({ i, type: mm[2] });
+  });
+  if (marks.length === 0) return src;
+
+  const isHr = line => /^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line);
+  const isHeading = line => /^\s*#/.test(line);
+
+  const segments = [];
+  for (let k = 0; k < marks.length; k++) {
+    if (marks[k].type !== 'Reply') continue;
+    const start = marks[k].i;
+    let end = lines.length;
+    for (let j = start + 1; j < lines.length; j++) {
+      if (marks.some(mk => mk.i === j)) { end = j; break; }
+      if (isHr(lines[j]) || isHeading(lines[j])) { end = j; break; }
+    }
+    segments.push(lines.slice(start, end).join('\n').trim());
+  }
+  return segments.join('\n\n').trim();
 }
 
 function isHost() {
@@ -387,7 +422,13 @@ function addBubble(m, number) {
   const color = p ? p.color : (isMe ? '#9fc1ea' : '#8fa0af');
   const label = messageName(m);
   const sub = m.sub ? `<span class="sub">${esc(m.sub)}</span>` : '';
-  row.innerHTML = `<div class="bubble"><div class="who" style="color:${color}"><span class="msgno">[${number}]</span>${esc(label)}${sub}<span class="ts">${esc(m.ts || '')}</span></div>${esc(m.text)}</div>`;
+  let bodyText = m.text;
+  let skipOnly = false;
+  if (role === 'ai' && !showFullOutput) {
+    bodyText = extractReplies(m.text);
+    if (!bodyText) { bodyText = '（本則無回覆內容）'; skipOnly = true; }
+  }
+  row.innerHTML = `<div class="bubble${skipOnly ? ' skip-only' : ''}"><div class="who" style="color:${color}"><span class="msgno">[${number}]</span>${esc(label)}${sub}<span class="ts">${esc(m.ts || '')}</span></div>${esc(bodyText)}</div>`;
   $('log').appendChild(row);
 }
 
@@ -490,6 +531,17 @@ $('newBtn').onclick = async () => {
   $('log').innerHTML = ''; state.total = 0;
   renderSessionTitle();
 };
+
+function renderFullOutputBtn() {
+  $('fullOutputBtn').className = showFullOutput ? 'on' : '';
+}
+$('fullOutputBtn').onclick = () => {
+  showFullOutput = !showFullOutput;
+  localStorage.setItem('ai_roundtable_show_full', showFullOutput ? '1' : '0');
+  renderFullOutputBtn();
+  $('log').innerHTML = ''; state.total = 0; poll();
+};
+renderFullOutputBtn();
 
 applyInviteFromUrl();
 poll();
