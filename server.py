@@ -38,6 +38,14 @@ SESSION_COOKIE = "ai_roundtable_session"
 PUBLIC_MODE = os.environ.get("AI_ROUNDTABLE_PUBLIC") == "1"
 PUBLIC_URL = (os.environ.get("AI_ROUNDTABLE_PUBLIC_URL") or "").strip().rstrip("/")
 
+# DNS-rebinding 防護：只放行白名單內的 HTTP Host 主機名（忽略 port）。
+# 伺服器綁 127.0.0.1（及選擇性的 Tailscale IP），且非 PUBLIC 模式會對 loopback 來源
+# 自動給 HOST。惡意網站可用 DNS rebinding（evil.com → 127.0.0.1）從瀏覽器對
+# 127.0.0.1:PORT 發出帶 cookie 的請求，這類請求來源仍是 loopback、會被自動當 HOST；
+# 但 rebinding 請求的 Host header 仍是 evil.com，故驗證主機名即可擋下。
+# main() 啟動時會依實際 runtime 值（Tailscale IP、公網 Funnel 名稱）擴充此集合。
+_ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
 # 每席位的可選模型；label 顯示在 UI 與訊息氣泡，其餘欄位由各 adapter 解讀。
 PARTICIPANTS = {
     "codex": {
@@ -113,6 +121,27 @@ class CallCancelled(Exception):
 
 def _is_loopback(ip):
     return ip == "::1" or ip.startswith("127.")
+
+
+def _host_hostname(host):
+    # 從 HTTP Host header 取出主機名（小寫），忽略 port。回傳 None 代表無法解析／缺 Host。
+    # 需正確處理：bare hostname、host:port、IPv6 loopback 的 ::1 與 [::1]:port。
+    host = (host or "").strip()
+    if not host:
+        return None
+    if host.startswith("["):  # bracketed IPv6, e.g. [::1] 或 [::1]:8787
+        end = host.find("]")
+        if end == -1:
+            return None
+        return host[1:end].lower()
+    if host.count(":") > 1:  # 不含中括號但有多個冒號 → bare IPv6 literal（如 ::1），無 port
+        return host.lower()
+    return host.split(":", 1)[0].lower()  # bare hostname 或 host:port
+
+
+def _host_allowed(host):
+    name = _host_hostname(host)
+    return name is not None and name in _ALLOWED_HOSTS
 
 
 def _clean_name(name, fallback):
@@ -1080,6 +1109,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _check_host(self):
+        # DNS-rebinding 防護：在任何路由／授權邏輯之前驗證 Host header。
+        # 缺 Host 或不在白名單一律拒絕（fail closed）。
+        if not _host_allowed(self.headers.get("Host")):
+            self._json({"error": "forbidden host"}, 403)
+            return False
+        return True
+
     def _current_session(self):
         sid = _read_cookie_sid(self.headers)
         with _lock:
@@ -1125,6 +1162,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self._check_host():
+            return
         parsed = urlsplit(self.path)
         path = parsed.path
         if path == "/" or path.startswith("/index"):
@@ -1156,6 +1195,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     def do_POST(self):
+        if not self._check_host():
+            return
         length = int(self.headers.get("Content-Length", 0))
         try:
             payload = json.loads(self.rfile.read(length) or b"{}")
@@ -1362,7 +1403,15 @@ def main():
     else:
         _open_browser_later()
     ts_ip = _tailscale_ip()
+    # DNS-rebinding 防護：把本次執行才知道的合法主機名補進白名單，否則 Tailscale 綁定
+    # 或公網 Funnel 訪客會被 Host 檢查擋成 403。_tailscale_* 傳回 None 就略過（不 crash）。
+    if PUBLIC_MODE:
+        for u in (PUBLIC_URL, _tailscale_funnel_url()):
+            h = urlsplit(u).hostname if u else None
+            if h:
+                _ALLOWED_HOSTS.add(h.lower())
     if ts_ip:
+        _ALLOWED_HOSTS.add(ts_ip.lower())
         try:
             ts_server = ThreadingHTTPServer((ts_ip, PORT), Handler)
             threading.Thread(target=ts_server.serve_forever, daemon=True).start()
