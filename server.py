@@ -1,7 +1,9 @@
 # ai-roundtable: 多 AI 圓桌討論室（localhost 單機工具）
 # 參與者 = CLI 呼叫配方；逐字稿(jsonl + md 鏡像)是唯一資料層。
+import hashlib
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -45,6 +47,28 @@ PUBLIC_URL = (os.environ.get("AI_ROUNDTABLE_PUBLIC_URL") or "").strip().rstrip("
 # 但 rebinding 請求的 Host header 仍是 evil.com，故驗證主機名即可擋下。
 # main() 啟動時會依實際 runtime 值（Tailscale IP、公網 Funnel 名稱）擴充此集合。
 _ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+# 開發模式：只能由啟動層進入（start_devmode.cmd 設 AI_ROUNDTABLE_DEVMODE=1）。
+# 執行期沒有任何切換模式的 API 或 UI——可寫權限烙在啟動時組出的 CLI 參數裡，
+# 避免執行期請求（含 prompt injection）翻轉唯讀圓桌。與 PUBLIC_MODE 互斥（見 main()）。
+DEVMODE = os.environ.get("AI_ROUNDTABLE_DEVMODE") == "1"
+DEV_CALL_TIMEOUT = int(os.environ.get("AI_ROUNDTABLE_DEV_TIMEOUT", "3600"))   # 開發模式單棒上限（秒）
+DEV_MAX_TURNS = int(os.environ.get("AI_ROUNDTABLE_DEV_MAX_TURNS", "40"))      # 整場總棒數上限
+DEV_MAX_ATTEMPTS = 3            # 單任務重試上限（規格 §5）
+DEV_BRANCH_PREFIX = "roundtable/dev-"
+TASKS_FILE = DATA / "tasks.json"
+DEVLOG_DIR = DATA / "devlogs"
+RATE_LIMIT_MARKERS = ("rate limit", "usage limit", "429", "quota", "usage_limit")  # 小寫比對
+
+# 開發模式輸出協議（規格書 §6）：prompt 模板與解析器共用同一份常數，不得各寫一份字面值。
+JSON_FENCE_OPEN = "```json"
+JSON_FENCE_CLOSE = "```"
+VERDICT_PASS = "驗證結果：通過"
+VERDICT_FAIL_PREFIX = "驗證結果：不通過—"
+ARBITRATION_REASSIGN_PREFIX = "仲裁：重派—"
+ARBITRATION_SKIP_PREFIX = "仲裁：跳過—"
+ARBITRATION_ASK_PREFIX = "仲裁：詢問—"
+PROTOCOL_RETRY_NOTE = "上次輸出不符格式，請重新輸出。"
 
 # 每席位的可選模型；label 顯示在 UI 與訊息氣泡，其餘欄位由各 adapter 解讀。
 PARTICIPANTS = {
@@ -97,6 +121,9 @@ DEFAULT_SELECTIONS = {
     "claude": "Opus 4.8 (High)",
 }
 
+# 開發模式角色→席位對應；v1 只由設定檔調整，UI 只顯示不提供編輯。
+DEFAULT_DEV_ROLES = {"controller": "claude", "implementer": "agy", "verifier": "codex"}
+
 _lock = threading.Lock()
 _messages = []
 _busy = {}  # name -> started_ts
@@ -113,10 +140,30 @@ _batch_watermark = {}  # seat name -> latest human message number successfully h
 _enabled_seats = []  # persisted AI seats that auto-answer any human message (host or guest)
 _batch_auto_rounds = 0
 _batch_blocked = False
+_dev_roles = DEFAULT_DEV_ROLES.copy()  # devmode 角色→席位對應（persisted；管線由 D2 消費）
+
+# 開發管線狀態（模組級，比照 _discussion；不持久化——斷點續作靠 tasks.json）。
+# pause_reason: manual/interject/rate_limit/tamper/parse_fail/seat_error/turn_cap/crash/ask_host
+_dev = {
+    "active": False, "paused": False, "pause_reason": "",
+    "stage": "", "current_task": None, "turn_count": 0, "branch": "",
+}
+_dev_pause_requested = False  # HOST 按「⏸」的請求旗標；當前棒跑完後生效
+_last_run = {}  # seat name -> 最近一次 _run_process 呼叫的 args/stdout/stderr/returncode/elapsed（管線稽核用）
+_data_hashes = {}  # str(path) -> sha256；伺服器自身寫入 TRANSCRIPT/MD_MIRROR/TASKS_FILE 後更新，供竄改偵測比對
+_trusted_tasks = None  # 最近一次伺服器成功落盤的 tasks.json 快照；竄改時不得信任磁碟上的內容
 
 
 class CallCancelled(Exception):
     pass
+
+
+class _RateLimited(Exception):
+    """席位呼叫命中限流特徵；管線層須據此暫停而不計入任務重試次數。"""
+
+
+class _PipelinePaused(Exception):
+    """安全閘門已落盤暫停；上層只需停止 pipeline，不得改寫 pause_reason。"""
 
 
 def _is_loopback(ip):
@@ -232,13 +279,58 @@ def _read_json(path, fallback):
         return fallback
 
 
+def _write_atomic(path, text):
+    # tasks.json 的唯一寫入管道：同目錄暫存檔 + os.replace，任何時點檔案內容都是完整合法 JSON。
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    _record_hash(path)
+
+
+def _hash_file(path):
+    path = Path(path)
+    if not path.exists():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _record_hash(path):
+    _data_hashes[str(Path(path))] = _hash_file(path)
+
+
+def _check_tamper():
+    # 竄改偵測：伺服器自己管理的三個檔案，每棒開始前重算雜湊比對上次自身寫入後記錄的值。
+    return all(_data_hashes.get(str(Path(p))) == _hash_file(p) for p in (TRANSCRIPT, MD_MIRROR, TASKS_FILE))
+
+
 def _default_settings():
     return {
         "project_dir": DEFAULT_PROJECT_DIR,
         "participants": DEFAULT_SELECTIONS.copy(),
         "enabled_seats": _default_enabled_seats(),
         "active_session": {"title": UNNAMED_TITLE, "created_at": _now()},
+        "dev_roles": DEFAULT_DEV_ROLES.copy(),
     }
+
+
+def _valid_dev_roles(raw):
+    # 驗證值必須是 PARTICIPANTS 的 key 且三角色互異，非法時回落預設。
+    if not isinstance(raw, dict):
+        return DEFAULT_DEV_ROLES.copy()
+    candidate = {role: raw.get(role) for role in DEFAULT_DEV_ROLES}
+    seats = list(candidate.values())
+    if all(seat in PARTICIPANTS for seat in seats) and len(set(seats)) == len(seats):
+        return candidate
+    return DEFAULT_DEV_ROLES.copy()
 
 
 def _coerce_settings(raw):
@@ -261,11 +353,12 @@ def _coerce_settings(raw):
         settings["enabled_seats"] = _normalize_seats(raw["enabled_seats"])
     if isinstance(raw.get("active_session"), dict):
         settings["active_session"].update(raw["active_session"])
+    settings["dev_roles"] = _valid_dev_roles(raw.get("dev_roles"))
     return settings
 
 
 def _load_settings():
-    global _project_dir, _active_session, _enabled_seats
+    global _project_dir, _active_session, _enabled_seats, _dev_roles
     settings = _coerce_settings(_read_json(SETTINGS, {}))
     project = settings.get("project_dir") or DEFAULT_PROJECT_DIR
     _project_dir = project if Path(project).is_dir() else DEFAULT_PROJECT_DIR
@@ -277,6 +370,7 @@ def _load_settings():
         _selected[name] = saved if saved in labels else default
 
     _enabled_seats = _normalize_seats(settings.get("enabled_seats"))
+    _dev_roles = _valid_dev_roles(settings.get("dev_roles"))
 
     active = settings.get("active_session") or {}
     _active_session = {
@@ -295,6 +389,7 @@ def _save_settings():
             "title": _active_session.get("title") or UNNAMED_TITLE,
             "created_at": _active_session.get("created_at") or _now(),
         },
+        "dev_roles": dict(_dev_roles),
     }
     SETTINGS.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
 
@@ -410,6 +505,8 @@ def _load():
             if line:
                 _messages.append(json.loads(line))
     _reset_batch_state()
+    _record_hash(TRANSCRIPT)
+    _record_hash(MD_MIRROR)
 
 
 def _rebuild_md():
@@ -429,8 +526,9 @@ def _unique_archive_paths(stamp):
     while True:
         transcript = DATA / f"transcript-{suffix}.jsonl"
         mirror = DATA / f"roundtable-{suffix}.md"
-        if not transcript.exists() and not mirror.exists():
-            return suffix, transcript, mirror
+        tasks = DATA / f"tasks-{suffix}.json"
+        if not transcript.exists() and not mirror.exists() and not tasks.exists():
+            return suffix, transcript, mirror, tasks
         suffix = f"{stamp}-{counter}"
         counter += 1
 
@@ -444,7 +542,7 @@ def _archive_active_session(reset_title=True):
         _reset_batch_state()
         return None
 
-    sid, archived_transcript, archived_mirror = _unique_archive_paths(_stamp())
+    sid, archived_transcript, archived_mirror, archived_tasks = _unique_archive_paths(_stamp())
     if TRANSCRIPT.exists():
         TRANSCRIPT.replace(archived_transcript)
     else:
@@ -458,6 +556,10 @@ def _archive_active_session(reset_title=True):
         _rebuild_md()
         MD_MIRROR.replace(archived_mirror)
 
+    tasks_archived = TASKS_FILE.exists()  # 開發模式的管線狀態隨會議一起封存（規格 §7）
+    if tasks_archived:
+        TASKS_FILE.replace(archived_tasks)
+
     entry = {
         "id": sid,
         "project_dir": _project_dir,
@@ -467,6 +569,7 @@ def _archive_active_session(reset_title=True):
         "message_count": len(_messages),
         "transcript_path": archived_transcript.name,
         "mirror_path": archived_mirror.name,
+        "tasks_path": archived_tasks.name if tasks_archived else None,
     }
     sessions = _load_sessions()
     sessions.append(entry)
@@ -488,6 +591,11 @@ def _restore_session(entry):
         raise FileNotFoundError("歸檔逐字稿檔案不存在")
     transcript.replace(TRANSCRIPT)
     mirror.replace(MD_MIRROR)
+    tasks_name = entry.get("tasks_path")
+    if tasks_name:
+        tasks_archive = DATA / tasks_name
+        if tasks_archive.exists():
+            tasks_archive.replace(TASKS_FILE)
     _project_dir = entry.get("project_dir") or _project_dir
     _active_session = {
         "title": entry.get("title") or UNNAMED_TITLE,
@@ -513,6 +621,8 @@ def append_message(speaker, text, sub=None, role=None, name=None):
         with TRANSCRIPT.open("a", encoding="utf-8") as f:
             f.write(json.dumps(msg, ensure_ascii=False) + "\n")
         _rebuild_md()
+        _record_hash(TRANSCRIPT)
+        _record_hash(MD_MIRROR)
     return msg
 
 
@@ -587,6 +697,7 @@ def _terminate_process(proc):
 
 
 def _run_process(name, args, *, input_text=None, stdin=None, cwd=None, env=None, timeout=CALL_TIMEOUT):
+    started = time.time()
     proc = subprocess.Popen(
         args,
         stdin=subprocess.PIPE if input_text is not None else stdin,
@@ -610,7 +721,13 @@ def _run_process(name, args, *, input_text=None, stdin=None, cwd=None, env=None,
                 stdout, stderr = proc.communicate(timeout=5)
             except Exception:
                 stdout, stderr = "", ""
+            _last_run[name] = {"args": args, "stdout": stdout, "stderr": stderr,
+                                "returncode": proc.returncode, "elapsed": time.time() - started}
             raise
+        # 開發管線的稽核日誌需要完整 stdout/stderr/exit code/耗時；這裡是唯一能拿到
+        # 完整 CompletedProcess 的地方（上層 _call_* 之後只回傳處理過的文字或拋例外）。
+        _last_run[name] = {"args": args, "stdout": stdout, "stderr": stderr,
+                            "returncode": proc.returncode, "elapsed": time.time() - started}
         return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
     finally:
         with _lock:
@@ -639,7 +756,8 @@ def _batch_instruction(name, start_no, end_no):
     )
 
 
-def _call_codex(name, instr, opt, env_extra=None):
+def _call_codex(name, instr, opt, env_extra=None, dev_role=None, timeout=CALL_TIMEOUT):
+    # dev_role 保留給開發管線分流用：驗證棒沿用討論版的 read-only 沙箱，不需要另外分支。
     env = os.environ.copy()
     if env_extra:
         env.update(env_extra)
@@ -651,7 +769,7 @@ def _call_codex(name, instr, opt, env_extra=None):
         out_path = tf.name
     args += ["-o", out_path]
     try:
-        proc = _run_process(name, args, input_text=instr, env=env, timeout=CALL_TIMEOUT)
+        proc = _run_process(name, args, input_text=instr, env=env, timeout=timeout)
         result = Path(out_path).read_text(encoding="utf-8", errors="replace").strip()
         if not result:
             tail = (proc.stdout or "").strip().splitlines()[-15:]
@@ -669,25 +787,32 @@ def _call_codex(name, instr, opt, env_extra=None):
             pass
 
 
-def _call_agy(name, instr, opt):
+def _call_agy(name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT):
     # 不使用 --dangerously-skip-permissions（會讓 agy 取得主機完全存取權，且會讓
     # --sandbox 失效）。改用 --sandbox：agy 目前沒有真正的唯讀/plan 模式可用於
     # 非互動 -p 執行（上游尚未支援，見 google-antigravity/antigravity-cli#45），
     # --sandbox 僅限制 shell/終端機工具，無法阻擋檔案寫入類工具──這是目前 agy
     # 所能提供的最大限制，並非完整唯讀保證。
+    # 開發管線的實作棒（dev_role == "implementer"）是唯一有筆的席位：改用
+    # --dangerously-skip-permissions 換取真正的可寫權限，殘餘風險見開發模式規格書 §9。
     args = [
         AGY_EXE, "-p", instr, "--model", opt["model"],
         "--add-dir", _project_dir, "--add-dir", str(DATA),
-        "--sandbox", "--print-timeout", f"{CALL_TIMEOUT - 60}s",
     ]
-    proc = _run_process(name, args, stdin=subprocess.DEVNULL, timeout=CALL_TIMEOUT)
+    if dev_role == "implementer":
+        args += ["--dangerously-skip-permissions"]
+    else:
+        args += ["--sandbox"]
+    args += ["--print-timeout", f"{timeout - 60}s"]
+    proc = _run_process(name, args, stdin=subprocess.DEVNULL, timeout=timeout)
     result = (proc.stdout or "").strip()
     if not result:
         raise RuntimeError("agy 沒有輸出。stderr：" + (proc.stderr or "")[-500:])
     return result
 
 
-def _call_claude(name, instr, opt):
+def _call_claude(name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT):
+    # dev_role 保留給開發管線分流用：主控棒沿用討論版的唯讀 allowedTools，不需要另外分支。
     exe = _find_claude()
     if not exe:
         raise RuntimeError("找不到 claude.exe（桌面 app 的 claude-code 資料夾不存在？）")
@@ -699,7 +824,7 @@ def _call_claude(name, instr, opt):
             "--allowedTools", "Read,Glob,Grep", "--add-dir", str(DATA)]
     if opt.get("effort"):
         args += ["--effort", opt["effort"]]
-    proc = _run_process(name, args, cwd=_project_dir, stdin=subprocess.DEVNULL, timeout=CALL_TIMEOUT)
+    proc = _run_process(name, args, cwd=_project_dir, stdin=subprocess.DEVNULL, timeout=timeout)
     result = (proc.stdout or "").strip()
     if proc.returncode != 0 or not result:
         raise RuntimeError(f"claude exit={proc.returncode}。stderr：" + (proc.stderr or "")[-500:])
@@ -707,8 +832,12 @@ def _call_claude(name, instr, opt):
 
 
 ADAPTERS = {
-    "codex": lambda name, instr, opt: _call_codex(name, instr, opt),
-    "ds": lambda name, instr, opt: _call_codex(name, instr, opt, {"CODEX_HOME": DS_CODEX_HOME}),
+    # codex/ds 的 lambda 要轉發 dev_role/timeout，開發管線的驗證棒（走 codex）才吃得到
+    # DEV_CALL_TIMEOUT；一般 ask() 路徑不帶這兩個關鍵字，沿用預設值，討論行為不變。
+    "codex": lambda name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT: _call_codex(
+        name, instr, opt, dev_role=dev_role, timeout=timeout),
+    "ds": lambda name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT: _call_codex(
+        name, instr, opt, {"CODEX_HOME": DS_CODEX_HOME}, dev_role=dev_role, timeout=timeout),
     "agy": _call_agy,
     "claude": _call_claude,
 }
@@ -984,6 +1113,915 @@ def run_discussion(names, max_rounds):
             _discussion["active"] = False
 
 
+# ---- 開發模式管線（Phase D2） ------------------------------------------------
+# 單一背景 thread 跑整條固定管線（拆任務→逐任務 實作/驗證/仲裁→收尾），tasks.json 是
+# 斷點續作的唯一事實來源；每一棒（席位 subprocess 呼叫）前後都做安全網檢查（竄改/煞車/
+# 插話/限流），細節見開發模式規格書 §5～§7 與開發設計方針.md。
+
+_JSON_FENCE_RE = re.compile(re.escape(JSON_FENCE_OPEN) + r"\s*(.*?)" + re.escape(JSON_FENCE_CLOSE), re.DOTALL)
+_devlog_seq = 0
+
+
+def _load_tasks():
+    return _read_json(TASKS_FILE, None)
+
+
+def _save_tasks(data):
+    global _trusted_tasks
+    payload = json.dumps(data, ensure_ascii=False, indent=1)
+    _write_atomic(TASKS_FILE, payload)
+    _trusted_tasks = json.loads(payload)
+
+
+def _remember_loaded_tasks(data):
+    # 僅供伺服器啟動時建立初始信任基準；執行期間的一般讀取不可刷新此快照。
+    global _trusted_tasks
+    _trusted_tasks = json.loads(json.dumps(data, ensure_ascii=False))
+    _record_hash(TASKS_FILE)
+
+
+def _trusted_tasks_copy():
+    if _trusted_tasks is None:
+        return None
+    return json.loads(json.dumps(_trusted_tasks, ensure_ascii=False))
+
+
+def _pause_tampered_data():
+    append_message("system", "⚠ 偵測到 data/ 目錄下的檔案被非伺服器途徑竄改，管線已暫停。")
+    data = _trusted_tasks_copy()
+    if data is not None:
+        _dev_pause_state(data, "tamper")
+    else:
+        with _lock:
+            _dev["paused"] = True
+            _dev["pause_reason"] = "tamper"
+
+
+
+def _git(*args, timeout=60):
+    return subprocess.run(
+        ["git", *args], cwd=_project_dir, capture_output=True,
+        text=True, encoding="utf-8", errors="replace", timeout=timeout,
+    )
+
+
+def _git_repo_check():
+    try:
+        r = _git("rev-parse", "--is-inside-work-tree")
+    except Exception as e:  # noqa: BLE001 - 目錄不存在／git 未安裝等都回可讀錯誤
+        return False, f"git 執行失敗：{e}"
+    if r.returncode != 0 or (r.stdout or "").strip() != "true":
+        return False, "專案目錄不是 git repo"
+    return True, ""
+
+
+def _git_precheck():
+    # 新啟管線的前置檢查：repo + 乾淨 working tree。續作路徑的髒 tree 有另外的
+    # 處置（見 _dev_start：管線分支上先 commit 殘留變更），不走本函式的乾淨要求。
+    ok, reason = _git_repo_check()
+    if not ok:
+        return ok, reason
+    r = _git("status", "--porcelain")
+    if r.returncode != 0:
+        return False, "git status 執行失敗"
+    if (r.stdout or "").strip():
+        return False, "working tree 有未提交的變更，請先手動處理後再啟動管線"
+    return True, ""
+
+
+def _git_commit_leftover(data):
+    # 實作棒中斷（限流/錯誤/crash/逾時）可能留下未 commit 的變更；續作時在管線分支上
+    # 由伺服器先收進一個標記 commit（規格 §5），讓驗證席仍有確定性的 diff 可查。
+    added = _git("add", "-A")
+    if added.returncode != 0:
+        raise RuntimeError(f"git add 失敗：{(added.stderr or '').strip()}")
+    status = _git("status", "--porcelain")
+    if status.returncode != 0:
+        raise RuntimeError(f"git status 失敗：{(status.stderr or '').strip()}")
+    if not (status.stdout or "").strip():
+        return None
+    task = next((t for t in data.get("tasks", []) if t.get("status") == "in_progress"), None)
+    tid = task["id"] if task else 0
+    commit = _git("commit", "-m", f"[roundtable] 任務{tid} 中斷殘留變更")
+    if commit.returncode != 0:
+        raise RuntimeError(f"git commit 失敗：{(commit.stderr or '').strip()}")
+    rev_result = _git("rev-parse", "--short", "HEAD")
+    if rev_result.returncode != 0:
+        raise RuntimeError(f"讀取 commit hash 失敗：{(rev_result.stderr or '').strip()}")
+    rev = (rev_result.stdout or "").strip()
+    if task is not None:
+        task["commits"].append(rev)  # 殘留變更屬於中斷的那個任務，驗證棒要看得到這個 diff
+    return rev
+
+
+def _git_new_branch():
+    branch = f"{DEV_BRANCH_PREFIX}{_stamp()}"
+    r = _git("checkout", "-b", branch)
+    if r.returncode != 0:
+        raise RuntimeError(f"建立分支失敗：{(r.stderr or '').strip()}")
+    return branch
+
+
+def _git_switch_branch(branch):
+    if not branch:
+        raise RuntimeError("tasks.json 未記錄分支名稱")
+    r = _git("checkout", branch)
+    if r.returncode != 0:
+        raise RuntimeError(f"切換分支失敗：{(r.stderr or '').strip()}")
+
+
+def _git_commit_task(task, attempt_no, seat_display):
+    # 無變更視為該次嘗試失敗（回傳 None），由呼叫端記 feedback，不進驗證棒。
+    added = _git("add", "-A")
+    if added.returncode != 0:
+        raise RuntimeError(f"git add 失敗：{(added.stderr or '').strip()}")
+    status = _git("status", "--porcelain")
+    if status.returncode != 0:
+        raise RuntimeError(f"git status 失敗：{(status.stderr or '').strip()}")
+    if not (status.stdout or "").strip():
+        return None
+    msg = f"[roundtable] 任務{task['id']} {seat_display} 第{attempt_no}次: {task['title']}"
+    commit = _git("commit", "-m", msg)
+    if commit.returncode != 0:
+        raise RuntimeError(f"git commit 失敗：{(commit.stderr or '').strip()}")
+    rev = _git("rev-parse", "--short", "HEAD")
+    if rev.returncode != 0:
+        raise RuntimeError(f"讀取 commit hash 失敗：{(rev.stderr or '').strip()}")
+    return (rev.stdout or "").strip()
+
+
+def _git_show_stat(sha):
+    r = _git("show", "--stat", sha)
+    if r.returncode != 0:
+        raise RuntimeError(f"git show 失敗：{(r.stderr or '').strip()}")
+    return (r.stdout or "").strip()
+
+
+def _parse_tasks(text, *, allow_empty=False):
+    # 取最後一個 json 圍欄並嚴格驗證規格 §6.1；不做部分接受或自動修補。
+    # done 任務的保留規則由消化棒呼叫端的 _merge_tasks 處理。
+    matches = _JSON_FENCE_RE.findall(text or "")
+    if not matches:
+        return None
+    try:
+        data = json.loads(matches[-1])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list) or (not tasks and not allow_empty):
+        return None
+    cleaned = []
+    seen_ids = set()
+    for t in tasks:
+        if not isinstance(t, dict) or not all(k in t for k in ("id", "title", "files", "acceptance")):
+            return None
+        task_id = t["id"]
+        title = t["title"]
+        files = t["files"]
+        acceptance = t["acceptance"]
+        if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0 or task_id in seen_ids:
+            return None
+        if not isinstance(title, str) or not title.strip():
+            return None
+        if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
+            return None
+        if (not isinstance(acceptance, list) or not all(isinstance(item, str) for item in acceptance)
+                or not any(item.strip() for item in acceptance)):
+            return None
+        seen_ids.add(task_id)
+        cleaned.append(t)
+    return cleaned
+
+
+def _parse_verdict(text):
+    for line in reversed((text or "").splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        if line == VERDICT_PASS:
+            return {"passed": True, "reason": ""}
+        if line.startswith(VERDICT_FAIL_PREFIX):
+            reason = line[len(VERDICT_FAIL_PREFIX):].strip()
+            return {"passed": False, "reason": reason} if reason else None
+        return None
+    return None
+
+
+def _parse_arbitration(text):
+    for line in reversed((text or "").splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(ARBITRATION_REASSIGN_PREFIX):
+            detail = line[len(ARBITRATION_REASSIGN_PREFIX):].strip()
+            return {"action": "reassign", "detail": detail} if detail else None
+        if line.startswith(ARBITRATION_SKIP_PREFIX):
+            detail = line[len(ARBITRATION_SKIP_PREFIX):].strip()
+            return {"action": "skip", "detail": detail} if detail else None
+        if line.startswith(ARBITRATION_ASK_PREFIX):
+            detail = line[len(ARBITRATION_ASK_PREFIX):].strip()
+            return {"action": "ask", "detail": detail} if detail else None
+        return None
+    return None
+
+
+def _tasks_from_parsed(parsed):
+    return [{
+        "id": t["id"], "title": t["title"],
+        "files": t.get("files") or [], "acceptance": t.get("acceptance") or [],
+        "status": "pending", "attempts": 0, "arbitrated": False,
+        "commits": [], "last_verdict": "",
+    } for t in parsed]
+
+
+def _merge_tasks(existing, parsed):
+    # 消化棒合併規則：以 id 對齊；done 任務保留原紀錄不可變更；新清單缺少的未完成任務視為刪除。
+    existing_by_id = {t["id"]: t for t in existing}
+    parsed_ids = {t["id"] for t in parsed}
+    merged = [t for t in existing if t.get("status") == "done" and t["id"] not in parsed_ids]
+    for t in parsed:
+        old = existing_by_id.get(t.get("id"))
+        if old and old.get("status") == "done":
+            merged.append(old)
+            continue
+        merged.append({
+            "id": t["id"], "title": t["title"],
+            "files": t.get("files") or [], "acceptance": t.get("acceptance") or [],
+            "status": (old or {}).get("status", "pending"),
+            "attempts": (old or {}).get("attempts", 0),
+            "arbitrated": (old or {}).get("arbitrated", False),
+            "commits": list((old or {}).get("commits", [])),
+            "last_verdict": (old or {}).get("last_verdict", ""),
+        })
+    return merged
+
+
+def _write_devlog(task_id, seat, stage, instruction, error=None):
+    global _devlog_seq
+    _devlog_seq += 1
+    info = _last_run.get(seat) or {}
+    DEVLOG_DIR.mkdir(exist_ok=True)
+    lines = [
+        f"args: {info.get('args')}",
+        f"returncode: {info.get('returncode')}",
+        f"elapsed: {info.get('elapsed', 0):.2f}s",
+        "",
+        "=== instruction ===",
+        instruction,
+        "",
+        "=== stdout ===",
+        info.get("stdout") or "",
+        "",
+        "=== stderr ===",
+        info.get("stderr") or "",
+    ]
+    if error:
+        lines += ["", "=== error ===", error]
+    tid = task_id if task_id is not None else 0
+    # stamp 只到秒，管線快跑（尤其測試）可能同秒多棒，故加遞增序號避免檔名撞掉。
+    path = DEVLOG_DIR / f"{_stamp()}-{_devlog_seq:04d}-task{tid}-{seat}-{stage}.log"
+    path.write_text("\n".join(str(x) for x in lines), encoding="utf-8")
+
+
+def _call_seat_checked(seat, instr, stage, task_id=None, dev_role=None, data=None):
+    # 管線唯一的席位呼叫入口：統一寫稽核日誌、統一偵測限流特徵。
+    if data is not None and _dev_gate_or_pause():
+        raise _PipelinePaused(_dev.get("pause_reason") or "gate")
+    _last_run.pop(seat, None)
+    try:
+        text = ADAPTERS[seat](seat, instr, _option(seat), dev_role=dev_role, timeout=DEV_CALL_TIMEOUT)
+        info = _last_run.get(seat) or {}
+        if info.get("returncode") not in (None, 0):
+            raise RuntimeError(f"{seat} exit={info['returncode']}")
+        _write_devlog(task_id, seat, stage, instr)
+        return text
+    except Exception as e:  # noqa: BLE001 - 先判斷是否為限流特徵，再決定要不要往外拋
+        _write_devlog(task_id, seat, stage, instr, error=str(e))
+        info = _last_run.get(seat) or {}
+        blob = f"{info.get('stdout', '')}\n{info.get('stderr', '')}\n{e}".lower()
+        if any(marker in blob for marker in RATE_LIMIT_MARKERS):
+            raise _RateLimited(str(e)) from e
+        raise
+    finally:
+        if data is not None:
+            _dev_record_turn(data)
+
+
+def _protocol_call(seat, instr, parse_fn, stage, task_id=None, dev_role=None, data=None):
+    # 解析失敗處理（規格 §6.4）：附「上次輸出不符格式」重問一次；再失敗由呼叫端轉入暫停。
+    text = _call_seat_checked(seat, instr, stage, task_id=task_id, dev_role=dev_role, data=data)
+    parsed = parse_fn(text)
+    if parsed is not None:
+        return text, parsed
+    retry_instr = instr + "\n\n" + PROTOCOL_RETRY_NOTE
+    text2 = _call_seat_checked(
+        seat, retry_instr, f"{stage}-retry", task_id=task_id, dev_role=dev_role, data=data)
+    return text2, parse_fn(text2)
+
+
+def _dev_instruction(stage, **kw):
+    # 上下文裁剪（規格 §5）：拆任務/仲裁/消化/收尾讀完整逐字稿；實作/驗證只讀固定小包裹。
+    controller_disp = PARTICIPANTS[_dev_roles["controller"]]["display"]
+    if stage == "dispatch":
+        return (
+            f"你是開發模式管線的主控席「{controller_disp}」，負責拆解任務。\n"
+            f"1. 先讀取完整逐字稿（UTF-8）：{MD_MIRROR}——內含主持人交代的開發目標與先前討論。\n"
+            f"2. 專案目錄：{_project_dir}，可唯讀查閱檔案佐證判斷。\n"
+            f"3. 現行 tasks.json 內容如下（tasks 為空代表尚未拆過任務）：\n{kw['tasks_json']}\n"
+            f"4. 請根據逐字稿中主持人交代的目標，拆出有序、可獨立驗收的任務清單，"
+            f"每項包含 id（從 1 遞增整數）、title、files（涉及檔案路徑陣列）、acceptance（驗收條件陣列）。\n"
+            f"5. 輸出末尾必須包含且只包含一個下列格式的 json 圍欄：\n"
+            f"{JSON_FENCE_OPEN}\n"
+            f'{{"tasks": [{{"id": 1, "title": "...", "files": ["..."], "acceptance": ["..."]}}]}}\n'
+            f"{JSON_FENCE_CLOSE}\n"
+            f"用繁體中文書寫圍欄前的說明文字。絕對不要建立、修改或刪除任何檔案。"
+        )
+    if stage == "digest":
+        return (
+            f"你是開發模式管線的主控席「{controller_disp}」，負責消化主持人插話並修訂任務清單。\n"
+            f"1. 先讀取完整逐字稿（UTF-8）：{MD_MIRROR}——留意最新的主持人發言。\n"
+            f"2. 專案目錄：{_project_dir}。\n"
+            f"3. 現行 tasks.json 內容：\n{kw['tasks_json']}\n"
+            f"4. 請依主持人最新發言修訂任務清單：已標記 status=done 的任務內容與狀態不可更動；"
+            f"其餘可依插話內容新增、修改；輸出清單中缺少的未完成任務將被視為刪除。\n"
+            f"5. 輸出末尾必須包含且只包含一個下列格式的**完整**（非增量）json 圍欄：\n"
+            f"{JSON_FENCE_OPEN}\n"
+            f'{{"tasks": [{{"id": 1, "title": "...", "files": ["..."], "acceptance": ["..."]}}]}}\n'
+            f"{JSON_FENCE_CLOSE}\n"
+            f"用繁體中文書寫圍欄前的說明文字。絕對不要建立、修改或刪除任何檔案。"
+        )
+    if stage == "arbitrate":
+        task = kw["task"]
+        return (
+            f"你是開發模式管線的主控席「{controller_disp}」，負責仲裁一個連續失敗的任務。\n"
+            f"1. 先讀取完整逐字稿（UTF-8）：{MD_MIRROR}。\n"
+            f"2. 專案目錄：{_project_dir}。\n"
+            f"3. 現行 tasks.json 內容：\n{kw['tasks_json']}\n"
+            f"4. 任務「{task['title']}」（id={task['id']}）已連續失敗 {task['attempts']} 次，"
+            f"最近一次驗證意見：{task.get('last_verdict') or '（無）'}。\n"
+            f"5. 請三選一裁決：重派（給實作席新指示、重試計數歸零重來）／跳過（放棄此任務標記 blocked）／"
+            f"詢問（暫停管線、交主持人拍板）。\n"
+            f"6. 輸出最後一行必須是（照抄格式，<>內填你的內容，不要多加標點）：\n"
+            f"{ARBITRATION_REASSIGN_PREFIX}<給實作席的新指示>\n"
+            f"{ARBITRATION_SKIP_PREFIX}<原因>\n"
+            f"{ARBITRATION_ASK_PREFIX}<要主持人拍板的問題>\n"
+            f"用繁體中文。絕對不要建立、修改或刪除任何檔案。"
+        )
+    if stage == "handoff":
+        return (
+            f"你是開發模式管線的主控席「{controller_disp}」，管線即將結束，請寫交接摘要。\n"
+            f"1. 先讀取完整逐字稿（UTF-8）：{MD_MIRROR}。\n"
+            f"2. 專案目錄：{_project_dir}。\n"
+            f"3. 現行 tasks.json 內容：\n{kw['tasks_json']}\n"
+            f"4. 請用繁體中文寫一段交接摘要：完成了什麼、哪些任務被跳過及原因、下次接手建議從哪裡開始。"
+            f"自由文字即可，不需要特殊格式。絕對不要建立、修改或刪除任何檔案。"
+        )
+    if stage == "implement":
+        task = kw["task"]
+        feedback = kw.get("last_verdict") or ""
+        feedback_block = f"\n5. 上次驗證意見（請針對此修正）：{feedback}\n" if feedback else "\n"
+        return (
+            f"你是開發模式管線的實作席，本棒任務是動手修改程式碼完成以下任務。\n"
+            f"1. 專案目錄（工作範圍僅限於此，不得寫入本目錄以外的路徑，"
+            f"尤其不得建立/修改/刪除 .git/ 或本工具自身的 data/ 目錄）：{_project_dir}\n"
+            f"2. 若專案目錄內有規格文件，請自行尋找並閱讀以理解需求脈絡。\n"
+            f"3. 本次任務簡報：\n"
+            f"   標題：{task['title']}\n"
+            f"   涉及檔案：{', '.join(task.get('files') or []) or '（未指定，依任務判斷）'}\n"
+            f"   驗收條件：{'; '.join(task.get('acceptance') or [])}\n"
+            f"4. 請直接動手建立/修改/刪除必要的檔案完成任務；完成後簡短說明你做了什麼變更即可，"
+            f"不需要自己執行 git commit（伺服器會處理）。"
+            f"{feedback_block}"
+            f"用繁體中文回覆。"
+        )
+    if stage == "verify":
+        task = kw["task"]
+        return (
+            f"你是開發模式管線的驗證席，只能唯讀查閱，任務是驗收下列任務的實作是否通過。\n"
+            f"1. 專案目錄：{_project_dir}，可用唯讀 git 指令（如 git show、git diff、git log）自行查閱細節 diff。\n"
+            f"2. 本次任務簡報：\n"
+            f"   標題：{task['title']}\n"
+            f"   涉及檔案：{', '.join(task.get('files') or []) or '（未指定）'}\n"
+            f"   驗收條件：{'; '.join(task.get('acceptance') or [])}\n"
+            f"3. 本次實作對應的 commit 與各自 stat：\n{kw['commits_block']}\n"
+            f"4. 請先比對 commit 變更的檔案與任務簡報範圍，凡動到與任務無關的檔案，"
+            f"一律判定不通過並在原因中列出越界檔案；再檢查是否滿足所有驗收條件。\n"
+            f"5. 輸出最後一行必須是（照抄格式，不要多加標點）：\n"
+            f"{VERDICT_PASS}\n{VERDICT_FAIL_PREFIX}<一句話原因>\n"
+            f"用繁體中文書寫理由段落。絕對不要建立、修改或刪除任何檔案。"
+        )
+    raise ValueError(f"unknown dev stage: {stage}")
+
+
+def _dev_touch(data):
+    with _lock:
+        _dev["turn_count"] += 1
+        data["turn_count"] = _dev["turn_count"]
+
+def _dev_record_turn(data):
+    # 每次實際啟動 subprocess 都是一棒；protocol retry 也必須各自計數並在重問前受 cap 約束。
+    _dev_touch(data)
+    data["updated_at"] = _now()
+    if not _check_tamper():
+        append_message("system", "⚠ 偵測到 data/ 目錄下的檔案被非伺服器途徑竄改，管線已暫停。")
+        _dev_pause_state(data, "tamper")
+        raise _PipelinePaused("tamper")
+    _save_tasks(data)
+
+
+
+def _dev_pause_state(data, reason):
+    with _lock:
+        _dev["paused"] = True
+        _dev["pause_reason"] = reason
+        watermark = _latest_human_no()  # 訊息水位：續作時據此判斷暫停期間是否有新的人類發言（規格 §5）
+    data["status"] = "paused"
+    data["pause_reason"] = reason
+    data["message_watermark"] = watermark
+    data["updated_at"] = _now()
+    _save_tasks(data)
+
+
+def _dev_run_dispatch(data):
+    with _lock:
+        _dev["stage"] = "dispatch"
+        _dev["current_task"] = None
+    seat = _dev_roles["controller"]
+    tasks_json = json.dumps(data, ensure_ascii=False, indent=1)
+    instr = _dev_instruction("dispatch", tasks_json=tasks_json)
+    text, parsed = _protocol_call(seat, instr, _parse_tasks, "dispatch", task_id=0, dev_role="controller", data=data)
+    append_message(seat, text, sub="拆任務")
+    if parsed is None:
+        _dev_pause_state(data, "parse_fail")
+        append_message("system", "⛔ 主控拆任務輸出連續兩次不符協議格式，管線暫停。")
+        return False
+    data["tasks"] = _tasks_from_parsed(parsed)
+    data["dispatched"] = True
+    data["status"] = "running"
+    data["updated_at"] = _now()
+    _save_tasks(data)
+    return True
+
+
+def _dev_run_implement(data, task):
+    with _lock:
+        _dev["stage"] = "implement"
+        _dev["current_task"] = task["id"]
+    seat = _dev_roles["implementer"]
+    task["attempts"] += 1
+    task["status"] = "in_progress"
+    data["updated_at"] = _now()
+    _save_tasks(data)  # 呼叫前先落盤：crash 續作時至少知道本次嘗試已計入
+
+    instr = _dev_instruction("implement", task=task, last_verdict=task.get("last_verdict"))
+    try:
+        text = _call_seat_checked(
+            seat, instr, "implement", task_id=task["id"], dev_role="implementer", data=data)
+    except Exception:
+        # 限流或席位錯誤不算「任務失敗」：attempts 滾回。若席位中斷時留下變更，
+        # 保留 in_progress 讓續作能把殘留 commit 掛回正確任務；乾淨則回 pending 重跑。
+        task["attempts"] -= 1
+        status = _git("status", "--porcelain")
+        has_leftover = status.returncode == 0 and bool((status.stdout or "").strip())
+        task["status"] = "in_progress" if has_leftover else "pending"
+        data["updated_at"] = _now()
+        _save_tasks(data)
+        raise
+    append_message(seat, text, sub=f"任務 {task['id']} · 實作")
+
+    commit = _git_commit_task(task, task["attempts"], PARTICIPANTS[seat]["display"])
+    if commit is None:
+        task["status"] = "pending"
+        task["last_verdict"] = "無任何檔案變更"
+        append_message("system", f"任務 {task['id']} 實作棒未產生任何檔案變更，記為本次嘗試失敗。")
+    else:
+        task["commits"].append(commit)
+    data["updated_at"] = _now()
+    _save_tasks(data)
+    return True
+
+
+def _dev_run_verify(data, task):
+    with _lock:
+        _dev["stage"] = "verify"
+        _dev["current_task"] = task["id"]
+    seat = _dev_roles["verifier"]
+    commits_block = "\n\n".join(
+        f"commit {c}:\n{_git_show_stat(c)}" for c in task.get("commits", [])
+    ) or "（無 commit）"
+    instr = _dev_instruction("verify", task=task, commits_block=commits_block)
+    text, verdict = _protocol_call(
+        seat, instr, _parse_verdict, "verify", task_id=task["id"], dev_role="verifier", data=data)
+    append_message(seat, text, sub=f"任務 {task['id']} · 驗證")
+    if verdict is None:
+        _dev_pause_state(data, "parse_fail")
+        append_message("system", f"⛔ 任務 {task['id']} 驗證棒輸出連續兩次不符協議格式，管線暫停。")
+        return False
+    if verdict["passed"]:
+        task["status"] = "done"
+        task["last_verdict"] = VERDICT_PASS
+    else:
+        task["status"] = "pending"
+        task["last_verdict"] = f"{VERDICT_FAIL_PREFIX}{verdict['reason']}"
+    data["updated_at"] = _now()
+    _save_tasks(data)
+    return True
+
+
+def _dev_run_arbitration(data, task):
+    with _lock:
+        _dev["stage"] = "arbitrate"
+        _dev["current_task"] = task["id"]
+    seat = _dev_roles["controller"]
+    tasks_json = json.dumps(data, ensure_ascii=False, indent=1)
+    instr = _dev_instruction("arbitrate", task=task, tasks_json=tasks_json)
+    text, verdict = _protocol_call(
+        seat, instr, _parse_arbitration, "arbitrate", task_id=task["id"], dev_role="controller", data=data)
+    append_message(seat, text, sub=f"任務 {task['id']} · 仲裁")
+    if verdict is None:
+        _dev_pause_state(data, "parse_fail")
+        append_message("system", f"⛔ 任務 {task['id']} 仲裁棒輸出連續兩次不符協議格式，管線暫停。")
+        return False
+    if verdict["action"] == "reassign":
+        task["arbitrated"] = True
+        task["attempts"] = 0
+        task["status"] = "pending"
+        task["last_verdict"] = f"{ARBITRATION_REASSIGN_PREFIX}{verdict['detail']}"
+        data["updated_at"] = _now()
+        _save_tasks(data)
+        return True
+    if verdict["action"] == "skip":
+        task["arbitrated"] = True
+        task["status"] = "blocked"
+        task["last_verdict"] = f"{ARBITRATION_SKIP_PREFIX}{verdict['detail']}"
+        data["updated_at"] = _now()
+        _save_tasks(data)
+        return True
+    # ask：暫停管線交主持人拍板。刻意不設 arbitrated——主持人回覆經消化棒後，
+    # 該任務 attempts 仍達上限且未仲裁，會再次進入仲裁棒，主控此時已有裁示可據以重派或跳過（規格 §5）。
+    task["last_verdict"] = f"{ARBITRATION_ASK_PREFIX}{verdict['detail']}"
+    _dev_pause_state(data, "ask_host")
+    append_message("system", f"⏸ 仲裁裁決為「詢問」，管線暫停等待主持人回應：{verdict['detail']}")
+    return False
+
+
+def _dev_run_digest(data):
+    with _lock:
+        _dev["stage"] = "digest"
+        _dev["current_task"] = None
+    seat = _dev_roles["controller"]
+    tasks_json = json.dumps(data, ensure_ascii=False, indent=1)
+    instr = _dev_instruction("digest", tasks_json=tasks_json)
+    text, parsed = _protocol_call(seat, instr, lambda output: _parse_tasks(output, allow_empty=True),
+                                  "digest", task_id=0, dev_role="controller", data=data)
+    append_message(seat, text, sub="消化插話")
+    if parsed is None:
+        _dev_pause_state(data, "parse_fail")
+        append_message("system", "⛔ 主控消化棒輸出連續兩次不符協議格式，管線暫停。")
+        return False
+    data["tasks"] = _merge_tasks(data["tasks"], parsed)
+    data["updated_at"] = _now()
+    _save_tasks(data)
+    return True
+
+
+def _dev_run_handoff(data):
+    with _lock:
+        _dev["stage"] = "handoff"
+        _dev["current_task"] = None
+    seat = _dev_roles["controller"]
+    tasks_json = json.dumps(data, ensure_ascii=False, indent=1)
+    instr = _dev_instruction("handoff", tasks_json=tasks_json)
+    text = _call_seat_checked(seat, instr, "handoff", task_id=0, dev_role="controller", data=data)
+    append_message(seat, text, sub="收尾")
+    data["handoff"] = text
+    data["status"] = "done"
+    data["pause_reason"] = ""
+    data["updated_at"] = _now()
+    _save_tasks(data)
+    with _lock:
+        _dev["paused"] = False
+        _dev["pause_reason"] = ""
+        _dev["stage"] = "done"
+        _dev["current_task"] = None
+
+
+def _dev_next_action(data):
+    """回傳 (action, task)：dispatch/handoff（無任務）或 implement/verify/arbitrate/auto_block（含任務）。"""
+    if not data["tasks"]:
+        return ("handoff" if data.get("dispatched") else "dispatch"), None
+    for t in data["tasks"]:
+        if t["status"] in ("done", "blocked"):
+            continue
+        if t["status"] == "pending" and t["attempts"] >= DEV_MAX_ATTEMPTS:
+            if t.get("arbitrated"):
+                return "auto_block", t
+            return "arbitrate", t
+        if t["status"] == "in_progress":
+            return "verify", t
+        return "implement", t
+    return "handoff", None
+
+
+def _dev_pre_gate():
+    """每棒開始前的安全網檢查。回傳 None 代表可以繼續，否則回傳 pause_reason。"""
+    if not _check_tamper():
+        return "tamper"
+    with _lock:
+        if _dev["turn_count"] >= DEV_MAX_TURNS:
+            return "turn_cap"
+    return None
+
+
+def _dev_post_gate(baseline):
+    """每棒結束後的檢查。回傳 'stop'（手動暫停生效）/ 'digest'（偵測到插話）/ 'continue'。"""
+    global _dev_pause_requested
+    with _lock:
+        if _dev_pause_requested:
+            _dev_pause_requested = False
+            return "stop"
+    with _lock:
+        interjected = any(_is_host_message(m) for m in _messages[baseline[0]:])
+    return "digest" if interjected else "continue"
+
+
+def _dev_gate_or_pause():
+    """跑每棒前置閘門；有問題時落盤暫停並回傳 True（代表管線要停線）。"""
+    gate = _dev_pre_gate()
+    if not gate:
+        return False
+    if gate == "tamper":
+        _pause_tampered_data()
+        return True
+    data = _load_tasks()
+    if data is not None:
+        _dev_pause_state(data, gate)
+    else:
+        with _lock:
+            _dev["paused"] = True
+            _dev["pause_reason"] = gate
+    return True
+
+
+def _dev_digest_step():
+    """跑一棒主控消化棒（含例外處理）；回傳 True 代表管線可繼續。"""
+    data = _load_tasks()
+    if data is None:
+        return False
+    try:
+        return _dev_run_digest(data)
+    except _PipelinePaused:
+        return False
+    except _RateLimited:
+        append_message("system", "⏸ 偵測到限流／用量上限特徵，管線暫停。")
+        _dev_pause_state(_load_tasks() or data, "rate_limit")
+        return False
+    except Exception as e:  # noqa: BLE001 - 未預期例外一律安全暫停，不讓執行緒靜默死掉
+        append_message("system", f"⛔ 管線發生未預期錯誤，已暫停：{e}")
+        _dev_pause_state(_load_tasks() or data, "seat_error")
+        return False
+
+
+def run_dev_pipeline(digest_first=False):
+    baseline = [0]
+    with _lock:
+        baseline[0] = len(_messages)
+    try:
+        if digest_first:
+            # 續作且暫停期間有新的人類發言（含仲裁「詢問」後主持人的拍板回覆）：
+            # 第一棒先跑消化棒讓主控讀到裁示、更新任務清單，之後照常走 _dev_next_action（規格 §5）。
+            if _dev_gate_or_pause():
+                return
+            if not _dev_digest_step():
+                return
+            with _lock:
+                baseline[0] = len(_messages)
+        while True:
+            if _dev_gate_or_pause():
+                return
+
+            data = _load_tasks()
+            if data is None:
+                return
+            action, task = _dev_next_action(data)
+
+            if action == "auto_block":
+                task["status"] = "blocked"
+                data["updated_at"] = _now()
+                _save_tasks(data)
+                continue  # 伺服器端狀態轉換，不算一棒，不需要後置閘門檢查
+
+            if action == "handoff":
+                try:
+                    _dev_run_handoff(data)
+                except _PipelinePaused:
+                    pass
+                except _RateLimited:
+                    append_message("system", "⏸ 偵測到限流／用量上限特徵，管線暫停。")
+                    _dev_pause_state(_load_tasks() or data, "rate_limit")
+                except Exception as e:  # noqa: BLE001 - 未預期例外一律安全暫停，不讓執行緒靜默死掉
+                    append_message("system", f"⛔ 管線發生未預期錯誤，已暫停：{e}")
+                    _dev_pause_state(_load_tasks() or data, "seat_error")
+                return
+
+            try:
+                if action == "dispatch":
+                    ok = _dev_run_dispatch(data)
+                elif action == "implement":
+                    ok = _dev_run_implement(data, task)
+                elif action == "verify":
+                    ok = _dev_run_verify(data, task)
+                else:  # arbitrate
+                    ok = _dev_run_arbitration(data, task)
+            except _PipelinePaused:
+                return
+            except _RateLimited:
+                append_message("system", "⏸ 偵測到限流／用量上限特徵，管線暫停（不計入該任務重試次數）。")
+                _dev_pause_state(_load_tasks() or data, "rate_limit")
+                return
+            except Exception as e:  # noqa: BLE001 - 未預期例外一律安全暫停，不讓執行緒靜默死掉
+                append_message("system", f"⛔ 管線發生未預期錯誤，已暫停：{e}")
+                _dev_pause_state(_load_tasks() or data, "seat_error")
+                return
+
+            if not ok:
+                return  # stage 內部已處理暫停狀態（parse_fail / ask_host）
+
+            outcome = _dev_post_gate(baseline)
+            if outcome == "stop":
+                data = _load_tasks()
+                if data is not None:
+                    _dev_pause_state(data, "manual")
+                return
+            if outcome == "digest":
+                if _dev_gate_or_pause():
+                    return
+                if not _dev_digest_step():
+                    return
+                with _lock:
+                    baseline[0] = len(_messages)
+    finally:
+        with _lock:
+            _dev["active"] = False
+
+
+def _latest_human_message_text():
+    for msg in reversed(_messages):
+        if _is_human_message(msg):
+            return msg.get("text", "")
+    return ""
+
+
+def _dev_start():
+    with _lock:
+        if _dev["active"]:
+            return False, "開發管線已在執行中"
+
+    if _trusted_tasks is not None and not _check_tamper():
+        _pause_tampered_data()
+        return False, "偵測到 data/ 管理檔案遭竄改，管線已暫停"
+
+    data = _load_tasks()
+    resuming = bool(data and data.get("status") in ("paused", "running"))
+    digest_first = False
+    if resuming:
+        ok, reason = _git_repo_check()
+        if not ok:
+            append_message("system", f"⛔ 開發管線無法續作：{reason}")
+            return False, reason
+        stored_project = data.get("project_dir")
+        if not isinstance(stored_project, str) or not _same_path(stored_project, _project_dir):
+            reason = "tasks.json 記錄的專案目錄與目前專案不一致"
+            append_message("system", f"⛔ 開發管線無法續作：{reason}")
+            return False, reason
+        branch = data.get("branch", "")
+        if not isinstance(branch, str) or not branch.startswith(DEV_BRANCH_PREFIX):
+            reason = "tasks.json 記錄的管線分支名稱無效"
+            append_message("system", f"⛔ 開發管線無法續作：{reason}")
+            return False, reason
+        data.setdefault("dispatched", bool(data.get("tasks")))
+        # 續作的髒 working tree（規格 §5）：實作棒中斷可能留下未 commit 的變更。
+        # 在管線分支上 → 伺服器先 commit 殘留變更再續跑；不在管線分支上 → 維持拒絕。
+        status = _git("status", "--porcelain")
+        if status.returncode != 0:
+            reason = f"git status 失敗：{(status.stderr or '').strip()}"
+            append_message("system", f"⛔ 開發管線無法續作：{reason}")
+            return False, reason
+        if (status.stdout or "").strip():
+            current_result = _git("branch", "--show-current")
+            if current_result.returncode != 0:
+                reason = f"讀取目前分支失敗：{(current_result.stderr or '').strip()}"
+                append_message("system", f"⛔ 開發管線無法續作：{reason}")
+                return False, reason
+            current = (current_result.stdout or "").strip()
+            if current != branch:
+                reason = "working tree 有未提交的變更且目前不在管線分支上，請先手動處理"
+                append_message("system", f"⛔ 開發管線無法續作：{reason}")
+                return False, reason
+            try:
+                rev = _git_commit_leftover(data)
+            except RuntimeError as e:
+                append_message("system", f"⛔ 開發管線無法續作：{e}")
+                return False, str(e)
+            if rev:
+                _save_tasks(data)
+                append_message("system", f"已將中斷殘留的未提交變更 commit（{rev}）後續作。")
+        try:
+            _git_switch_branch(branch)
+        except RuntimeError as e:
+            append_message("system", f"⛔ 開發管線無法續作：{e}")
+            return False, str(e)
+        # 暫停期間的人類發言（含仲裁「詢問」後主持人的拍板）→ 續作第一棒先跑消化棒。
+        # 舊檔或 crash 降級沒有水位紀錄（get 回 None）→ 保守起見有人類發言就先消化。
+        watermark = data.get("message_watermark")
+        digest_first = _latest_human_no() > (watermark if isinstance(watermark, int) else 0)
+        # 總棒數上限的續作語意（規格 §5）：HOST 按「▶」視為重新授權一輪預算，計數歸零重計。
+        data["turn_count"] = 0
+        data["status"] = "running"
+        data["pause_reason"] = ""
+        data["updated_at"] = _now()
+        _save_tasks(data)
+    else:
+        ok, reason = _git_precheck()
+        if not ok:
+            append_message("system", f"⛔ 開發管線無法啟動：{reason}")
+            return False, reason
+        latest = _latest_human_message_text()
+        if not latest:
+            return False, "尚未有主持人發言可作為開發目標，請先輸入開發目標"
+        try:
+            branch = _git_new_branch()
+        except RuntimeError as e:
+            append_message("system", f"⛔ 開發管線無法啟動：{e}")
+            return False, str(e)
+        data = {
+            "version": 1, "status": "running", "pause_reason": "",
+            "branch": branch, "project_dir": _project_dir,
+            "session_goal": latest, "turn_count": 0,
+            "message_watermark": _latest_human_no(), "dispatched": False,
+            "updated_at": _now(), "tasks": [], "handoff": "",
+        }
+        _save_tasks(data)
+
+    global _dev_pause_requested
+    with _lock:
+        _dev.update({
+            "active": True, "paused": False, "pause_reason": "",
+            "stage": "", "current_task": None,
+            "turn_count": data.get("turn_count", 0), "branch": branch,
+        })
+        _dev_pause_requested = False
+    threading.Thread(target=run_dev_pipeline, kwargs={"digest_first": digest_first}, daemon=True).start()
+    return True, ""
+
+
+def _dev_request_pause():
+    global _dev_pause_requested
+    with _lock:
+        _dev_pause_requested = True
+
+
+def _dev_downgrade_crash():
+    # 伺服器重啟時發現 tasks.json 仍是「執行中」→ 一定是異常結束（crash），降級為暫停。
+    data = _load_tasks()
+    if data and data.get("status") == "running":
+        data["status"] = "paused"
+        data["pause_reason"] = "crash"
+        data["updated_at"] = _now()
+        _save_tasks(data)
+
+
+def _dev_load_from_tasks():
+    # 啟動時把 tasks.json 現況同步進 _dev（記憶體狀態不持久化，重啟後預設值不反映實際暫停中）。
+    data = _load_tasks()
+    if not data:
+        return
+    _remember_loaded_tasks(data)
+    with _lock:
+        _dev["active"] = False
+        _dev["paused"] = data.get("status") == "paused"
+        _dev["pause_reason"] = data.get("pause_reason", "") if _dev["paused"] else ""
+        _dev["branch"] = data.get("branch", "")
+        _dev["turn_count"] = data.get("turn_count", 0)
+        _dev["stage"] = ""
+        _dev["current_task"] = None
+
+
+def _dev_payload():
+    data = _load_tasks() if DEVMODE else None
+    total = len(data.get("tasks", [])) if data else 0
+    with _lock:
+        return {
+            "devmode": DEVMODE, "roles": dict(_dev_roles),
+            "active": _dev["active"], "paused": _dev["paused"],
+            "pause_reason": _dev["pause_reason"], "stage": _dev["stage"],
+            "current_task": _dev["current_task"], "task_total": total,
+            "turn_count": _dev["turn_count"], "branch": _dev["branch"],
+        }
+
+
 def _participants_payload():
     return {
         name: {
@@ -1190,6 +2228,7 @@ class Handler(BaseHTTPRequestHandler):
                     "session_title": _session_title(),
                     "discussion": dict(_discussion),
                     "session": _session_payload(session),
+                    "dev": _dev_payload(),
                 })
         else:
             self._json({"error": "not found"}, 404)
@@ -1205,6 +2244,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/api/token/verify":
+            if DEVMODE:  # 開發模式停用邀請／guest 加入：單人本機工作模式。
+                self._json({"error": "invites disabled in dev mode"}, 403)
+                return
             result = _redeem_invite(payload.get("token"), payload.get("name"))
             if not result:
                 self._json({"error": "invalid or expired token"}, 401)
@@ -1215,6 +2257,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/api/token/generate":
+            if DEVMODE:  # 開發模式停用邀請／guest 加入：單人本機工作模式。
+                self._json({"error": "invites disabled in dev mode"}, 403)
+                return
             session = self._require_host()
             if not session:
                 return
@@ -1329,8 +2374,38 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "host required"}, 403)
                 return
             with _lock:
+                dev_active = _dev["active"]
+                dev_unfinished = _dev["paused"]
+            if dev_active:
+                self._json({"error": "開發管線執行中，無法開新會議"}, 409)
+                return
+            if dev_unfinished:
+                self._json({"error": "開發管線已暫停但尚未收尾，無法開新會議"}, 409)
+                return
+            with _lock:
                 archived = _archive_active_session()
             self._json({"ok": True, "archived": archived, "session_title": _session_title()})
+        elif self.path == "/api/dev/start":
+            if not DEVMODE:
+                self._json({"error": "dev mode required"}, 403)
+                return
+            if session.get("role") != "host":
+                self._json({"error": "host required"}, 403)
+                return
+            ok, reason = _dev_start()
+            if not ok:
+                self._json({"error": reason}, 400)
+                return
+            self._json({"ok": True})
+        elif self.path == "/api/dev/pause":
+            if not DEVMODE:
+                self._json({"error": "dev mode required"}, 403)
+                return
+            if session.get("role") != "host":
+                self._json({"error": "host required"}, 403)
+                return
+            _dev_request_pause()
+            self._json({"ok": True})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -1375,8 +2450,22 @@ def _open_browser_later(url=None):
 
 
 def main():
+    if DEVMODE and PUBLIC_MODE:
+        # 開發模式的可寫權限與 PUBLIC 模式對外曝露互斥：兩者同時開等於把有筆的
+        # 席位攤在公網前，直接拒絕啟動而不是挑一邊默默生效。
+        print(
+            "error: AI_ROUNDTABLE_DEVMODE=1 與 AI_ROUNDTABLE_PUBLIC=1 不能同時啟用"
+            "（開發模式的可寫席位不可對外公開曝露）。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     _load_settings()
     _load()
+    if DEVMODE:
+        # 伺服器重啟時發現 tasks.json 是「執行中」一律降級為暫停（規格 §5 驗收）；
+        # 接著把現況同步進記憶體中的 _dev，讓 /api/state 立刻反映真實暫停狀態。
+        _dev_downgrade_crash()
+        _dev_load_from_tasks()
     _prompt_project_dir()
     _prompt_restore_session()
     for path, label in [(AGY_EXE, "agy"), (CODEX_CMD, "codex")]:
@@ -1402,7 +2491,9 @@ def main():
         _open_browser_later(host_link)  # 直接開 HOST 進場連結，省得手動貼
     else:
         _open_browser_later()
-    ts_ip = _tailscale_ip()
+    # 開發模式只綁 loopback：不嘗試偵測／綁定 Tailscale IP，避免有可寫席位的
+    # 管線經區網／Tailscale 曝露。
+    ts_ip = None if DEVMODE else _tailscale_ip()
     # DNS-rebinding 防護：把本次執行才知道的合法主機名補進白名單，否則 Tailscale 綁定
     # 或公網 Funnel 訪客會被 Host 檢查擋成 403。_tailscale_* 傳回 None 就略過（不 crash）。
     if PUBLIC_MODE:

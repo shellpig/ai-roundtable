@@ -52,6 +52,11 @@
     border-radius: 8px; font-size: 12px; padding: 3px 4px; max-width: 190px;
   }
   .mselect:focus { outline: none; border-color: #4c8bf5; }
+  #devBadge {
+    display: none; border: 1px solid #d97757; color: #d97757; border-radius: 16px;
+    padding: 3px 10px; font-size: 12px; font-weight: bold; letter-spacing: 1px;
+  }
+  #devBadge.show { display: inline-block; }
   #inviteBtn { margin-left: auto; }
   #inviteBtn, #newBtn, #fullOutputBtn { background: none; border: 1px solid var(--line);
     color: var(--dim); border-radius: 8px; padding: 4px 10px; cursor: pointer; }
@@ -128,6 +133,7 @@
 <body>
 <header>
   <h1>AI 圓桌</h1>
+  <span id="devBadge" title="開發模式：AI 席位可對專案目錄讀寫">開發模式</span>
   <span id="sessionTitle" title="點擊修改會議名稱">未命名會議</span>
   <span id="chips"></span>
   <button id="inviteBtn" title="產生 3 分鐘有效的一次性邀請碼" style="display:none">邀請</button>
@@ -157,7 +163,7 @@
   </div>
 </footer>
 <script>
-const state = { total: 0, participants: {}, enabled: {}, busy: [], sessionTitle: '未命名會議', session: null };
+const state = { total: 0, participants: {}, enabled: {}, busy: [], sessionTitle: '未命名會議', session: null, dev: { devmode: false } };
 let enableInflight = 0; // >0 時暫停用伺服器值覆蓋本地樂觀切換
 const $ = id => document.getElementById(id);
 let editingTitle = false;
@@ -208,7 +214,10 @@ function setAuthVisible(visible) {
 
 function updateRoleUi() {
   const host = isHost();
-  $('inviteBtn').style.display = host ? '' : 'none';
+  const devmode = !!(state.dev && state.dev.devmode);
+  $('devBadge').className = devmode ? 'show' : '';
+  // 開發模式停用邀請／guest 加入：不論 host 與否都不顯示邀請鈕。
+  $('inviteBtn').style.display = (host && !devmode) ? '' : 'none';
   $('newBtn').disabled = !host;
   $('sessionTitle').style.cursor = host ? 'pointer' : 'default';
   $('hintText').innerHTML = host
@@ -459,6 +468,7 @@ async function poll() {
     if (r.status === 401) { setAuthVisible(true); return; }
     const j = await r.json();
     state.session = j.session || state.session;
+    state.dev = j.dev || state.dev;
     setAuthVisible(false);
     state.participants = j.participants;
     state.sessionTitle = j.session_title || '未命名會議';
