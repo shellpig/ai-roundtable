@@ -616,6 +616,33 @@ class GitIntegrationTests(DevmodeTestCase):
             "[roundtable] 任務1 中斷殘留變更",
         )
 
+    def test_implement_zero_diff_routes_to_verify_without_recording_failure(self):
+        self.init_git()
+        branch = server._git_new_branch()
+        task = self.task()
+        task["last_verdict"] = "上一棒的驗證意見"
+        data = self.state([task])
+        data["branch"] = branch
+        server._save_tasks(data)
+
+        def no_change(name, instruction, option, dev_role=None, timeout=None, session_id=None):
+            return "已確認任務先前已被滿足，未修改任何檔案。"
+
+        server.ADAPTERS["agy"] = no_change
+
+        self.assertTrue(server._dev_run_implement(data, task))
+
+        self.assertEqual(task["status"], "in_progress")
+        self.assertEqual(task["attempts"], 1)
+        self.assertEqual(task["commits"], [])
+        self.assertEqual(task["last_verdict"], "上一棒的驗證意見")
+        self.assertEqual(task["last_failure_fingerprint"], "")
+        self.assertEqual(task["consecutive_same_failures"], 0)
+        self.assertEqual(data["status"], "running")
+        self.assertEqual(data.get("pause_reason", ""), "")
+        self.assertIn("逕付驗證", server._messages[-1]["text"])
+        self.assertEqual(server._dev_next_action(data), ("verify", task))
+
     def test_resume_rejects_tasks_from_another_project(self):
         self.init_git()
         branch = server._git_new_branch()
@@ -724,8 +751,10 @@ class SafetyAndAdapterTests(DevmodeTestCase):
         self.assertNotIn("--dangerously-skip-permissions", discussion_args)
         self.assertIn("--dangerously-skip-permissions", implement_args)
         self.assertNotIn("--sandbox", implement_args)
-        self.assertNotIn("instruction", discussion_args)
-        self.assertEqual(agy_calls[0][1]["input_text"], "instruction")
+        # agy 的 -p 不讀 stdin，提示須以 argv 傳遞，且不再送 stdin 內容。
+        self.assertIn("instruction", discussion_args)
+        self.assertEqual(agy_calls[0][1]["stdin"], subprocess.DEVNULL)
+        self.assertNotIn("input_text", agy_calls[0][1])
         self.assertEqual(agy_calls[1][1]["timeout"], server.DEV_CALL_TIMEOUT)
 
         claude_calls = []

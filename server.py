@@ -940,8 +940,9 @@ def _call_agy(name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT, session_id=
     # 所能提供的最大限制，並非完整唯讀保證。
     # 開發管線的實作棒（dev_role == "implementer"）是唯一有筆的席位：改用
     # --dangerously-skip-permissions 換取真正的可寫權限，殘餘風險見開發模式規格書 §9。
+    # agy 的 -p 是 --print 別名，會直接吃 argv 下一個 token 當提示，不讀 stdin，故此處提示須走 argv。
     args = [
-        AGY_EXE, "-p", "--model", opt["model"],
+        AGY_EXE, "-p", instr, "--model", opt["model"],
         "--add-dir", _project_dir, "--add-dir", str(DATA),
     ]
     if dev_role == "implementer":
@@ -949,7 +950,7 @@ def _call_agy(name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT, session_id=
     else:
         args += ["--sandbox"]
     args += ["--print-timeout", f"{timeout - 60}s"]
-    proc = _run_process(name, args, input_text=instr, timeout=timeout)
+    proc = _run_process(name, args, stdin=subprocess.DEVNULL, timeout=timeout)
     result = (proc.stdout or "").strip()
     if not result:
         raise RuntimeError("agy 沒有輸出。stderr：" + (proc.stderr or "")[-500:])
@@ -2172,14 +2173,10 @@ def _dev_run_implement(data, task):
 
     commit = _git_commit_task(task, task["attempts"], PARTICIPANTS[seat]["display"])
     if commit is None:
-        task["status"] = "pending"
-        task["last_verdict"] = "無任何檔案變更"
-        append_message("system", f"任務 {task['id']} 實作棒未產生任何檔案變更，記為本次嘗試失敗。")
-        repeated = _record_task_failure(task, "implement_no_change", task["last_verdict"])
-        if repeated:
-            _dev_pause_state(data, "repeated_failure")
-            append_message("system", f"⏸ 任務 {task['id']} 相同失敗連續出現第 2 次，管線暫停。")
-            return False
+        # 零檔案變更不等於任務失敗：任務可能已被先前 commit 滿足。不記失敗、不動
+        # status，維持函式開頭已設的 in_progress，讓 _dev_next_action 照常路由到
+        # 驗證棒，由驗證席依 base_commit...HEAD 淨 diff 判定實際是否已完成。
+        append_message("system", f"任務 {task['id']} 實作棒無新檔案變更，逕付驗證。")
     else:
         task["commits"].append(commit)
     data["updated_at"] = _now()
