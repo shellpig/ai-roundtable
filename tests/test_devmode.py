@@ -293,6 +293,22 @@ class ProtocolExecutionTests(DevmodeTestCase):
         self.assertEqual(data["pause_reason"], "ask_host")
         self.assertEqual(data["message_watermark"], 0)
 
+    def test_arbitration_uses_compact_task_brief(self):
+        task = self.task(attempts=server.DEV_MAX_ATTEMPTS)
+        other = self.task(2, status="done")
+        data = self.state([task, other])
+        server._save_tasks(data)
+        server.append_message("agy", "very old implementation output" * 200)
+        calls = self.install_adapter("claude", [server.ARBITRATION_ASK_PREFIX + "choose scope"])
+
+        self.assertFalse(server._dev_run_arbitration(data, task))
+
+        instruction = calls[0]["instruction"]
+        self.assertIn('"other_tasks"', instruction)
+        self.assertIn('"id": 2', instruction)
+        self.assertNotIn("very old implementation output", instruction)
+        self.assertNotIn('"acceptance_criteria"', instruction)
+
 
 
 
@@ -647,6 +663,8 @@ class SafetyAndAdapterTests(DevmodeTestCase):
         self.assertNotIn("--dangerously-skip-permissions", discussion_args)
         self.assertIn("--dangerously-skip-permissions", implement_args)
         self.assertNotIn("--sandbox", implement_args)
+        self.assertNotIn("instruction", discussion_args)
+        self.assertEqual(agy_calls[0][1]["input_text"], "instruction")
         self.assertEqual(agy_calls[1][1]["timeout"], server.DEV_CALL_TIMEOUT)
 
         claude_calls = []
@@ -676,6 +694,8 @@ class SafetyAndAdapterTests(DevmodeTestCase):
         self.assertNotIn("WebSearch", claude_args)
         self.assertEqual(claude_kwargs["cwd"], str(self.project_dir))
         self.assertEqual(claude_kwargs["timeout"], server.DEV_CALL_TIMEOUT)
+        self.assertNotIn("instruction", claude_args)
+        self.assertEqual(claude_kwargs["input_text"], "instruction")
         self.assertIn("--output-format", claude_args)
         self.assertIn("--no-session-persistence", claude_calls[1][0])
 
@@ -919,8 +939,14 @@ class D4FeatureTests(DevmodeTestCase):
         server._save_meeting_summary(summary)
         task = self.task()
         implement = server._dev_instruction("implement", task=task)
+        verify = server._dev_instruction("verify", task=task, diff_range="base...HEAD", diff_block="diff")
+        integration = server._dev_instruction(
+            "integration_verify", diff_range="main...HEAD", diff_block="diff", tasks_json="[]")
         digest = server._dev_instruction("digest", tasks_json="{}")
         self.assertIn("no deps", implement)
+        self.assertNotIn("tests pass", implement)
+        self.assertNotIn("tests pass", verify)
+        self.assertIn("tests pass", integration)
         self.assertNotIn(str(server.MEETING_SUMMARY_FILE), implement)
         self.assertNotIn(str(server.MD_MIRROR), implement)
         self.assertIn("decision", digest)

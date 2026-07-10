@@ -937,7 +937,7 @@ def _call_agy(name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT, session_id=
     # 開發管線的實作棒（dev_role == "implementer"）是唯一有筆的席位：改用
     # --dangerously-skip-permissions 換取真正的可寫權限，殘餘風險見開發模式規格書 §9。
     args = [
-        AGY_EXE, "-p", instr, "--model", opt["model"],
+        AGY_EXE, "-p", "--model", opt["model"],
         "--add-dir", _project_dir, "--add-dir", str(DATA),
     ]
     if dev_role == "implementer":
@@ -945,7 +945,7 @@ def _call_agy(name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT, session_id=
     else:
         args += ["--sandbox"]
     args += ["--print-timeout", f"{timeout - 60}s"]
-    proc = _run_process(name, args, stdin=subprocess.DEVNULL, timeout=timeout)
+    proc = _run_process(name, args, input_text=instr, timeout=timeout)
     result = (proc.stdout or "").strip()
     if not result:
         raise RuntimeError("agy 沒有輸出。stderr：" + (proc.stderr or "")[-500:])
@@ -961,7 +961,7 @@ def _call_claude(name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT, session_
     # prompt injection，這兩個工具可把本機專案內容外洩到攻擊者控制的網址；此席位
     # 的工作只需唯讀檢視本機專案，不需要網路存取（尤其此工具可經 Tailscale Funnel
     # 公開曝露）。
-    args = [exe, "-p", instr, "--model", opt["model"],
+    args = [exe, "-p", "--model", opt["model"],
             "--allowedTools", "Read,Glob,Grep", "--add-dir", str(DATA)]
     if dev_role:
         args += ["--output-format", "json"]
@@ -971,7 +971,7 @@ def _call_claude(name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT, session_
             args += ["--no-session-persistence"]
     if opt.get("effort"):
         args += ["--effort", opt["effort"]]
-    proc = _run_process(name, args, cwd=_project_dir, stdin=subprocess.DEVNULL, timeout=timeout)
+    proc = _run_process(name, args, input_text=instr, cwd=_project_dir, timeout=timeout)
     result = (proc.stdout or "").strip()
     if proc.returncode != 0 or not result:
         raise RuntimeError(f"claude exit={proc.returncode}。stderr：" + (proc.stderr or "")[-500:])
@@ -1862,16 +1862,40 @@ def _controller_context():
     )
 
 
-def _summary_projection():
+def _summary_projection(include_acceptance=False):
     summary = _valid_saved_summary()
     if summary is None:
         return "（會議摘要不可用；依任務簡報與專案規格文件判斷）"
-    return (
+    text = (
         "相關決議：" + "; ".join(summary.get("decisions") or ["（無）"])
         + "\n全域限制：" + "; ".join(summary.get("global_constraints") or ["（無）"])
-        + "\n全域驗收：" + "; ".join(summary.get("acceptance_criteria") or ["（無）"])
     )
+    if include_acceptance:
+        text += "\n全域驗收：" + "; ".join(summary.get("acceptance_criteria") or ["（無）"])
+    return text
 
+
+def _arbitration_brief(data, task):
+    """提供仲裁所需的最小狀態，避免把完整逐字稿或 tasks.json 塞入命令列。"""
+    summary = _valid_saved_summary()
+    task_brief = {
+        key: task.get(key)
+        for key in (
+            "id", "title", "files", "acceptance", "status", "attempts",
+            "last_verdict", "last_failure_fingerprint", "consecutive_same_failures",
+        )
+    }
+    other_tasks = [
+        {key: item.get(key) for key in ("id", "title", "status")}
+        for item in data.get("tasks", [])
+        if item.get("id") != task.get("id")
+    ]
+    return json.dumps({
+        "goal": (summary or {}).get("goal", ""),
+        "global_constraints": (summary or {}).get("global_constraints", []),
+        "task": task_brief,
+        "other_tasks": other_tasks,
+    }, ensure_ascii=False, indent=1)
 
 def _dev_instruction(stage, **kw):
     # 上下文裁剪（規格 §5）：拆任務/仲裁/消化/收尾讀完整逐字稿；實作/驗證只讀固定小包裹。
@@ -1913,12 +1937,12 @@ def _dev_instruction(stage, **kw):
         )
     if stage == "arbitrate":
         task = kw["task"]
-        context, _ = _controller_context()
+        context = "仲裁只使用下列任務摘要；不得因未列出的後續任務產物判定目前任務失敗。"
         return (
             f"你是開發模式管線的主控席「{controller_disp}」，負責仲裁一個連續失敗的任務。\n"
-            f"1. 依下列裁剪後上下文處理；只有其中明示摘要不可用時才讀完整逐字稿：\n{context}\n"
+            f"1. 僅依下列裁剪仲裁摘要處理；不要讀取完整逐字稿：\n{context}\n"
             f"2. 專案目錄：{_project_dir}。\n"
-            f"3. 現行 tasks.json 內容：\n{kw['tasks_json']}\n"
+            f"3. 仲裁摘要：\n{kw['tasks_json']}\n"
             f"4. 任務「{task['title']}」（id={task['id']}）已連續失敗 {task['attempts']} 次，"
             f"最近一次驗證意見：{task.get('last_verdict') or '（無）'}。\n"
             f"5. 請三選一裁決：重派（給實作席新指示、重試計數歸零重來）／跳過（放棄此任務標記 blocked）／"
@@ -1970,7 +1994,8 @@ def _dev_instruction(stage, **kw):
             f"   適用的會議限制：\n{_summary_projection()}\n"
             f"3. 驗證 range：{kw['diff_range']}；最終 name-status／stat：\n{kw['diff_block']}\n"
             f"4. 請先比對最終 net diff 與任務簡報範圍，凡最終仍動到與任務無關的檔案，"
-            f"一律判定不通過並在原因中列出越界檔案；再檢查是否滿足所有驗收條件。\n"
+            f"一律判定不通過並在原因中列出越界檔案；再檢查是否滿足本次任務簡報列出的驗收條件。"
+            f"全域驗收由收尾整合驗收階段檢查，不得作為單一任務門檻。\n"
             f"5. 輸出最後一行必須是（照抄格式，不要多加標點）：\n"
             f"{VERDICT_PASS}\n{VERDICT_FAIL_PREFIX}<一句話原因>\n"
             f"用繁體中文書寫理由段落。絕對不要建立、修改或刪除任何檔案。"
@@ -1981,7 +2006,7 @@ def _dev_instruction(stage, **kw):
             f"1. 專案目錄：{_project_dir}。只看 {kw['diff_range']} 的最終 net diff，不重讀歷史 commits。\n"
             f"2. 全部任務與驗收：\n{kw['tasks_json']}\n"
             f"3. 最終 name-status／stat：\n{kw['diff_block']}\n"
-            f"4. 適用的會議限制：\n{_summary_projection()}\n"
+            f"4. 適用的會議限制：\n{_summary_projection(include_acceptance=True)}\n"
             f"5. 輸出最後一行必須是：\n{VERDICT_PASS}\n{VERDICT_FAIL_PREFIX}<一句話原因>\n"
             f"用繁體中文。絕對不要建立、修改或刪除任何檔案。"
         )
@@ -2123,7 +2148,7 @@ def _dev_run_arbitration(data, task):
         _dev["stage"] = "arbitrate"
         _dev["current_task"] = task["id"]
     seat = _dev_roles["controller"]
-    tasks_json = json.dumps(data, ensure_ascii=False, indent=1)
+    tasks_json = _arbitration_brief(data, task)
     instr = _dev_instruction("arbitrate", task=task, tasks_json=tasks_json)
     text, verdict = _protocol_call(
         seat, instr, _parse_arbitration, "arbitrate", task_id=task["id"], dev_role="controller", data=data)
