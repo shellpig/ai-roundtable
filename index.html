@@ -547,7 +547,8 @@ function renderDiscussBar(d) {
 // ---- 開發模式 UI（devBtn / devBar）----
 const DEV_STAGE_NAMES = {
   dispatch: '拆任務', implement: '實作', verify: '驗證',
-  arbitrate: '仲裁', digest: '消化插話', handoff: '收尾', done: '已完成',
+  arbitrate: '仲裁', digest: '消化插話', integration_verify: '整合驗收',
+  handoff: '收尾', done: '已完成',
 };
 const DEV_PAUSE_REASONS = {
   manual: '主持人手動暫停',
@@ -559,6 +560,8 @@ const DEV_PAUSE_REASONS = {
   turn_cap: '已達總棒數上限，按 ▶ 重新授權一輪',
   crash: '伺服器曾中斷，按 ▶ 從中斷任務續作',
   ask_host: '仲裁詢問中，請回覆後按 ▶ 續作',
+  repeated_failure: '相同失敗連續出現第 2 次，請修訂任務或給主控新指示',
+  integration_failed: '收尾整合驗證未通過',
 };
 const ROLES_CUSTOM_WARN = '⚠ 非預設角色映射：能力與安全性由使用者自行確認';
 
@@ -568,21 +571,47 @@ function devRolesText(d) {
   return `主控 ${disp(r.controller)} · 實作 ${disp(r.implementer)} · 驗證 ${disp(r.verifier)}`;
 }
 
+function tokenText(value) {
+  if (value === null || value === undefined) return 'usage unavailable';
+  if (value >= 1000000) return `${(value / 1000000).toFixed(1)}m`;
+  if (value >= 1000) return `${(value / 1000).toFixed(1)}k`;
+  return String(value);
+}
+
+function devUsageText(d) {
+  const usage = d.usage || {};
+  const last = usage.last || {};
+  const lastText = last.provider
+    ? `${last.provider} ${tokenText(last.total_tokens)}`
+    : 'usage unavailable';
+  const byProvider = usage.by_provider || {};
+  const totals = ['codex', 'claude'].map(name => {
+    const entry = byProvider[name];
+    return `${name} ${tokenText(entry && entry.total_tokens)}`;
+  }).join(' · ');
+  const known = Object.keys(byProvider).length ? tokenText(usage.known_total_tokens) : 'usage unavailable';
+  return `最近一棒：${lastText} · 本輪已知：${known}（${totals}）`;
+}
+
 function renderDevBar(d) {
   const bar = $('devBar');
-  if (!d || !d.devmode || (!d.active && !d.paused)) { bar.style.display = 'none'; return; }
+  const hasUsage = d && d.usage && Object.keys(d.usage.last || {}).length > 0;
+  if (!d || !d.devmode || (!d.active && !d.paused && !hasUsage)) { bar.style.display = 'none'; return; }
   let text;
   if (d.active) {
     const stage = DEV_STAGE_NAMES[d.stage] || d.stage || '準備中';
     const taskPart = d.current_task ? `任務 ${d.current_task}/${d.task_total} · ` : '';
     text = `🛠 開發管線執行中 · ${taskPart}${stage} · ${d.branch || ''}`;
-  } else {
+  } else if (d.paused) {
     const reason = DEV_PAUSE_REASONS[d.pause_reason] || d.pause_reason || '';
     text = `⏸ 開發管線已暫停 · ${reason} · ${d.branch || ''}`;
+  } else {
+    text = `✅ 開發管線已完成 · ${d.branch || ''}`;
   }
   const roles = devRolesText(d) + (d.roles_custom ? `（${ROLES_CUSTOM_WARN}）` : '');
+  const usage = devUsageText(d);
   bar.className = 'dev-bar' + (d.pause_reason === 'tamper' ? ' warn' : '');
-  bar.innerHTML = `${esc(text)}<span class="roles">${esc(roles)}</span>`;
+  bar.innerHTML = `${esc(text)}<span class="roles">${esc(roles)} · ${esc(usage)}</span>`;
   bar.style.display = '';
 }
 

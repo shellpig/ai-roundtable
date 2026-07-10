@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -57,6 +58,7 @@ DEV_MAX_TURNS = int(os.environ.get("AI_ROUNDTABLE_DEV_MAX_TURNS", "40"))      # 
 DEV_MAX_ATTEMPTS = 3            # 單任務重試上限（規格 §5）
 DEV_BRANCH_PREFIX = "roundtable/dev-"
 TASKS_FILE = DATA / "tasks.json"
+MEETING_SUMMARY_FILE = DATA / "meeting_summary.json"
 DEVLOG_DIR = DATA / "devlogs"
 RATE_LIMIT_MARKERS = ("rate limit", "usage limit", "429", "quota", "usage_limit")  # 小寫比對
 
@@ -152,6 +154,7 @@ _dev_pause_requested = False  # HOST 按「⏸」的請求旗標；當前棒跑�
 _last_run = {}  # seat name -> 最近一次 _run_process 呼叫的 args/stdout/stderr/returncode/elapsed（管線稽核用）
 _data_hashes = {}  # str(path) -> sha256；伺服器自身寫入 TRANSCRIPT/MD_MIRROR/TASKS_FILE 後更新，供竄改偵測比對
 _trusted_tasks = None  # 最近一次伺服器成功落盤的 tasks.json 快照；竄改時不得信任磁碟上的內容
+_trusted_meeting_summary = None
 
 
 class CallCancelled(Exception):
@@ -308,8 +311,9 @@ def _record_hash(path):
 
 
 def _check_tamper():
-    # 竄改偵測：伺服器自己管理的三個檔案，每棒開始前重算雜湊比對上次自身寫入後記錄的值。
-    return all(_data_hashes.get(str(Path(p))) == _hash_file(p) for p in (TRANSCRIPT, MD_MIRROR, TASKS_FILE))
+    # 竄改偵測：伺服器自己管理的檔案，每棒開始前重算雜湊比對上次自身寫入後記錄的值。
+    managed = (TRANSCRIPT, MD_MIRROR, TASKS_FILE, MEETING_SUMMARY_FILE)
+    return all(_data_hashes.get(str(Path(p))) == _hash_file(p) for p in managed)
 
 
 def _default_settings():
@@ -507,6 +511,7 @@ def _load():
     _reset_batch_state()
     _record_hash(TRANSCRIPT)
     _record_hash(MD_MIRROR)
+    _remember_loaded_meeting_summary(_load_meeting_summary())
 
 
 def _rebuild_md():
@@ -527,14 +532,15 @@ def _unique_archive_paths(stamp):
         transcript = DATA / f"transcript-{suffix}.jsonl"
         mirror = DATA / f"roundtable-{suffix}.md"
         tasks = DATA / f"tasks-{suffix}.json"
-        if not transcript.exists() and not mirror.exists() and not tasks.exists():
-            return suffix, transcript, mirror, tasks
+        summary = DATA / f"meeting-summary-{suffix}.json"
+        if not transcript.exists() and not mirror.exists() and not tasks.exists() and not summary.exists():
+            return suffix, transcript, mirror, tasks, summary
         suffix = f"{stamp}-{counter}"
         counter += 1
 
 
 def _archive_active_session(reset_title=True):
-    global _active_session
+    global _active_session, _trusted_tasks, _trusted_meeting_summary
     if not _messages:
         if reset_title:
             _active_session = {"title": UNNAMED_TITLE, "created_at": _now()}
@@ -542,7 +548,7 @@ def _archive_active_session(reset_title=True):
         _reset_batch_state()
         return None
 
-    sid, archived_transcript, archived_mirror, archived_tasks = _unique_archive_paths(_stamp())
+    sid, archived_transcript, archived_mirror, archived_tasks, archived_summary = _unique_archive_paths(_stamp())
     if TRANSCRIPT.exists():
         TRANSCRIPT.replace(archived_transcript)
     else:
@@ -559,6 +565,9 @@ def _archive_active_session(reset_title=True):
     tasks_archived = TASKS_FILE.exists()  # 開發模式的管線狀態隨會議一起封存（規格 §7）
     if tasks_archived:
         TASKS_FILE.replace(archived_tasks)
+    summary_archived = MEETING_SUMMARY_FILE.exists()
+    if summary_archived:
+        MEETING_SUMMARY_FILE.replace(archived_summary)
 
     entry = {
         "id": sid,
@@ -570,11 +579,16 @@ def _archive_active_session(reset_title=True):
         "transcript_path": archived_transcript.name,
         "mirror_path": archived_mirror.name,
         "tasks_path": archived_tasks.name if tasks_archived else None,
+        "meeting_summary_path": archived_summary.name if summary_archived else None,
     }
     sessions = _load_sessions()
     sessions.append(entry)
     _save_sessions(sessions)
     _messages.clear()
+    _trusted_tasks = None
+    _trusted_meeting_summary = None
+    for managed in (TRANSCRIPT, MD_MIRROR, TASKS_FILE, MEETING_SUMMARY_FILE):
+        _record_hash(managed)
     _reset_batch_state()
     if reset_title:
         _active_session = {"title": UNNAMED_TITLE, "created_at": _now()}
@@ -596,6 +610,11 @@ def _restore_session(entry):
         tasks_archive = DATA / tasks_name
         if tasks_archive.exists():
             tasks_archive.replace(TASKS_FILE)
+    summary_name = entry.get("meeting_summary_path")
+    if summary_name:
+        summary_archive = DATA / summary_name
+        if summary_archive.exists():
+            summary_archive.replace(MEETING_SUMMARY_FILE)
     _project_dir = entry.get("project_dir") or _project_dir
     _active_session = {
         "title": entry.get("title") or UNNAMED_TITLE,
@@ -605,6 +624,10 @@ def _restore_session(entry):
     _save_sessions(sessions)
     _save_settings()
     _load()
+    restored_tasks = _read_json(TASKS_FILE, None)
+    if restored_tasks is not None:
+        _remember_loaded_tasks(restored_tasks)
+    _remember_loaded_meeting_summary(_load_meeting_summary())
 
 
 def append_message(speaker, text, sub=None, role=None, name=None):
@@ -756,11 +779,129 @@ def _batch_instruction(name, start_no, end_no):
     )
 
 
-def _call_codex(name, instr, opt, env_extra=None, dev_role=None, timeout=CALL_TIMEOUT):
+def _unavailable_usage():
+    return {
+        "source": "unavailable", "input_tokens": None, "cached_input_tokens": None,
+        "output_tokens": None, "total_tokens": None, "cost_usd": None,
+    }
+
+
+def _adapter_result(text, usage=None, session_id=None, *, resumed=False, resume_failed=False,
+                    persistence_fallback=False):
+    return {
+        "text": text,
+        "usage": usage or _unavailable_usage(),
+        "session": {
+            "id": session_id, "resumed": resumed, "resume_failed": resume_failed,
+            "persistence_fallback": persistence_fallback,
+        },
+    }
+
+
+def _codex_json_result(stdout, *, resumed=False, persistence_fallback=False):
+    text = ""
+    session_id = None
+    usage = None
+    for line in (stdout or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind = event.get("type")
+        if kind == "thread.started":
+            session_id = event.get("thread_id")
+        elif kind == "item.completed":
+            item = event.get("item") or {}
+            if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                text = item["text"]
+        elif kind == "turn.completed" and isinstance(event.get("usage"), dict):
+            raw = event["usage"]
+            input_total = raw.get("input_tokens") if isinstance(raw.get("input_tokens"), int) else None
+            cached = raw.get("cached_input_tokens") if isinstance(raw.get("cached_input_tokens"), int) else None
+            output = raw.get("output_tokens") if isinstance(raw.get("output_tokens"), int) else None
+            uncached = max(input_total - cached, 0) if input_total is not None and cached is not None else input_total
+            total = input_total + output if input_total is not None and output is not None else None
+            usage = {
+                "source": "cli_json", "input_tokens": uncached, "cached_input_tokens": cached,
+                "output_tokens": output, "total_tokens": total, "cost_usd": None,
+            }
+    if not text:
+        raise RuntimeError("codex JSONL 沒有 agent_message 最終回覆")
+    return _adapter_result(
+        text, usage, None if persistence_fallback else session_id,
+        resumed=resumed, persistence_fallback=persistence_fallback,
+    )
+
+
+def _claude_json_result(stdout, *, resumed=False):
+    try:
+        payload = json.loads((stdout or "").strip())
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("claude JSON 輸出無法解析") from exc
+    text = payload.get("result")
+    if not isinstance(text, str) or not text.strip():
+        raise RuntimeError("claude JSON 沒有 result 最終回覆")
+    raw = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    input_tokens = raw.get("input_tokens") if isinstance(raw.get("input_tokens"), int) else None
+    cached_values = [raw.get("cache_creation_input_tokens"), raw.get("cache_read_input_tokens")]
+    cached = sum(v for v in cached_values if isinstance(v, int)) if any(isinstance(v, int) for v in cached_values) else None
+    output_tokens = raw.get("output_tokens") if isinstance(raw.get("output_tokens"), int) else None
+    total = None
+    if input_tokens is not None and output_tokens is not None:
+        total = input_tokens + output_tokens + (cached or 0)
+    cost = payload.get("total_cost_usd")
+    usage = {
+        "source": "cli_json" if raw or isinstance(cost, (int, float)) else "unavailable",
+        "input_tokens": input_tokens, "cached_input_tokens": cached,
+        "output_tokens": output_tokens, "total_tokens": total,
+        "cost_usd": cost if isinstance(cost, (int, float)) else None,
+    }
+    return _adapter_result(text.strip(), usage, payload.get("session_id"), resumed=resumed)
+
+
+def _call_codex(name, instr, opt, env_extra=None, dev_role=None, timeout=CALL_TIMEOUT, session_id=None):
     # dev_role 保留給開發管線分流用：驗證棒沿用討論版的 read-only 沙箱，不需要另外分支。
     env = os.environ.copy()
     if env_extra:
         env.update(env_extra)
+    if dev_role:
+        args = [CODEX_CMD, "exec"]
+        if session_id:
+            args += ["resume", session_id, "-"]
+            args += ["--skip-git-repo-check", "--json", "-m", opt["model"]]
+        else:
+            args += ["-"]
+            args += ["--sandbox", "read-only", "--skip-git-repo-check", "-C", _project_dir,
+                     "--json", "--color", "never", "-m", opt["model"]]
+            if dev_role == "verifier":
+                args += ["--ephemeral"]
+        if opt.get("effort"):
+            args += ["-c", f"model_reasoning_effort={opt['effort']}"]
+        proc = _run_process(name, args, input_text=instr, env=env, cwd=_project_dir, timeout=timeout)
+        persistence_fallback = False
+        if proc.returncode != 0:
+            blob = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
+            persistence_error = (
+                dev_role != "verifier"
+                and "failed to record rollout items" in blob
+                and "thread" in blob
+                and "not found" in blob
+                and not any(marker in blob for marker in RATE_LIMIT_MARKERS)
+            )
+            if not persistence_error:
+                raise RuntimeError(f"codex exit={proc.returncode}。stderr：" + (proc.stderr or "")[-500:])
+            fallback_args = [*args, "--ephemeral"]
+            proc = _run_process(
+                name, fallback_args, input_text=instr, env=env, cwd=_project_dir, timeout=timeout)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"codex persistence fallback exit={proc.returncode}。stderr："
+                    + (proc.stderr or "")[-500:]
+                )
+            persistence_fallback = True
+        return _codex_json_result(
+            proc.stdout, resumed=bool(session_id), persistence_fallback=persistence_fallback)
+
     args = [CODEX_CMD, "exec", "-", "--sandbox", "read-only", "--skip-git-repo-check",
             "-C", _project_dir, "--ephemeral", "--color", "never", "-m", opt["model"]]
     if opt.get("effort"):
@@ -787,7 +928,7 @@ def _call_codex(name, instr, opt, env_extra=None, dev_role=None, timeout=CALL_TI
             pass
 
 
-def _call_agy(name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT):
+def _call_agy(name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT, session_id=None):
     # 不使用 --dangerously-skip-permissions（會讓 agy 取得主機完全存取權，且會讓
     # --sandbox 失效）。改用 --sandbox：agy 目前沒有真正的唯讀/plan 模式可用於
     # 非互動 -p 執行（上游尚未支援，見 google-antigravity/antigravity-cli#45），
@@ -808,10 +949,10 @@ def _call_agy(name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT):
     result = (proc.stdout or "").strip()
     if not result:
         raise RuntimeError("agy 沒有輸出。stderr：" + (proc.stderr or "")[-500:])
-    return result
+    return _adapter_result(result) if dev_role else result
 
 
-def _call_claude(name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT):
+def _call_claude(name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT, session_id=None):
     # dev_role 保留給開發管線分流用：主控棒沿用討論版的唯讀 allowedTools，不需要另外分支。
     exe = _find_claude()
     if not exe:
@@ -822,22 +963,29 @@ def _call_claude(name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT):
     # 公開曝露）。
     args = [exe, "-p", instr, "--model", opt["model"],
             "--allowedTools", "Read,Glob,Grep", "--add-dir", str(DATA)]
+    if dev_role:
+        args += ["--output-format", "json"]
+        if session_id:
+            args += ["--resume", session_id]
+        elif dev_role == "verifier":
+            args += ["--no-session-persistence"]
     if opt.get("effort"):
         args += ["--effort", opt["effort"]]
     proc = _run_process(name, args, cwd=_project_dir, stdin=subprocess.DEVNULL, timeout=timeout)
     result = (proc.stdout or "").strip()
     if proc.returncode != 0 or not result:
         raise RuntimeError(f"claude exit={proc.returncode}。stderr：" + (proc.stderr or "")[-500:])
-    return result
+    return _claude_json_result(result, resumed=bool(session_id)) if dev_role else result
 
 
 ADAPTERS = {
     # codex/ds 的 lambda 要轉發 dev_role/timeout，開發管線的驗證棒（走 codex）才吃得到
     # DEV_CALL_TIMEOUT；一般 ask() 路徑不帶這兩個關鍵字，沿用預設值，討論行為不變。
-    "codex": lambda name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT: _call_codex(
-        name, instr, opt, dev_role=dev_role, timeout=timeout),
-    "ds": lambda name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT: _call_codex(
-        name, instr, opt, {"CODEX_HOME": DS_CODEX_HOME}, dev_role=dev_role, timeout=timeout),
+    "codex": lambda name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT, session_id=None: _call_codex(
+        name, instr, opt, dev_role=dev_role, timeout=timeout, session_id=session_id),
+    "ds": lambda name, instr, opt, dev_role=None, timeout=CALL_TIMEOUT, session_id=None: _call_codex(
+        name, instr, opt, {"CODEX_HOME": DS_CODEX_HOME}, dev_role=dev_role, timeout=timeout,
+        session_id=session_id),
     "agy": _call_agy,
     "claude": _call_claude,
 }
@@ -1122,8 +1270,56 @@ _JSON_FENCE_RE = re.compile(re.escape(JSON_FENCE_OPEN) + r"\s*(.*?)" + re.escape
 _devlog_seq = 0
 
 
+def _empty_usage_state():
+    return {"last": {}, "by_provider": {}, "known_total_tokens": 0, "incomplete": False}
+
+
+def _migrate_tasks(data):
+    if not isinstance(data, dict):
+        return data, False
+    changed = data.get("version") != 2
+    data = json.loads(json.dumps(data, ensure_ascii=False))
+    data["version"] = 2
+    if not isinstance(data.get("sessions"), dict):
+        data["sessions"] = {}
+        changed = True
+    if not isinstance(data.get("usage"), dict):
+        data["usage"] = _empty_usage_state()
+        changed = True
+    else:
+        defaults = _empty_usage_state()
+        for key, value in defaults.items():
+            if key not in data["usage"]:
+                data["usage"][key] = value
+                changed = True
+    for task in data.get("tasks", []):
+        defaults = {
+            "base_commit": "",
+            "last_failure_fingerprint": "",
+            "consecutive_same_failures": 0,
+        }
+        for key, value in defaults.items():
+            if key not in task:
+                task[key] = value
+                changed = True
+    if "integration_verified" not in data:
+        data["integration_verified"] = False
+        changed = True
+    if "main_commit" not in data:
+        data["main_commit"] = ""
+        data["git_baselines_pending"] = True
+        changed = True
+    return data, changed
+
+
 def _load_tasks():
-    return _read_json(TASKS_FILE, None)
+    data = _read_json(TASKS_FILE, None)
+    if data is None:
+        return None
+    migrated, changed = _migrate_tasks(data)
+    if changed:
+        _save_tasks(migrated)
+    return migrated
 
 
 def _save_tasks(data):
@@ -1144,6 +1340,29 @@ def _trusted_tasks_copy():
     if _trusted_tasks is None:
         return None
     return json.loads(json.dumps(_trusted_tasks, ensure_ascii=False))
+
+
+def _load_meeting_summary():
+    return _read_json(MEETING_SUMMARY_FILE, None)
+
+
+def _save_meeting_summary(summary):
+    global _trusted_meeting_summary
+    payload = json.dumps(summary, ensure_ascii=False, indent=1)
+    _write_atomic(MEETING_SUMMARY_FILE, payload)
+    _trusted_meeting_summary = json.loads(payload)
+
+
+def _remember_loaded_meeting_summary(summary):
+    global _trusted_meeting_summary
+    _trusted_meeting_summary = json.loads(json.dumps(summary, ensure_ascii=False)) if summary else None
+    _record_hash(MEETING_SUMMARY_FILE)
+
+
+def _trusted_summary_copy():
+    if _trusted_meeting_summary is None:
+        return None
+    return json.loads(json.dumps(_trusted_meeting_summary, ensure_ascii=False))
 
 
 def _pause_tampered_data():
@@ -1257,7 +1476,101 @@ def _git_show_stat(sha):
     return (r.stdout or "").strip()
 
 
-def _parse_tasks(text, *, allow_empty=False):
+def _git_head():
+    r = _git("rev-parse", "HEAD")
+    if r.returncode != 0:
+        raise RuntimeError(f"讀取 HEAD 失敗：{(r.stderr or '').strip()}")
+    return (r.stdout or "").strip()
+
+
+def _git_diff_summary(base_commit):
+    diff_range = f"{base_commit}...HEAD"
+    name_status = _git("diff", "--name-status", diff_range)
+    stat = _git("diff", "--stat", diff_range)
+    if name_status.returncode != 0 or stat.returncode != 0:
+        err = (name_status.stderr or stat.stderr or "").strip()
+        raise RuntimeError(f"讀取最終 net diff 失敗：{err}")
+    block = "=== name-status ===\n" + (name_status.stdout or "（無變更）").strip()
+    block += "\n=== stat ===\n" + (stat.stdout or "（無變更）").strip()
+    return diff_range, block
+
+
+def _backfill_git_baselines(data):
+    """舊 v1 管線續作時，從實際 commit graph 回填 D4 baseline；不可在純 JSON migration 猜測。"""
+    if not data.get("git_baselines_pending") and data.get("main_commit"):
+        return False
+    merge_base = _git("merge-base", "HEAD", "main")
+    if merge_base.returncode != 0 or not (merge_base.stdout or "").strip():
+        raise RuntimeError(f"無法回填管線 main baseline：{(merge_base.stderr or '').strip()}")
+    data["main_commit"] = (merge_base.stdout or "").strip()
+    for task in data.get("tasks", []):
+        if task.get("base_commit"):
+            continue
+        commits = task.get("commits") or []
+        if commits:
+            parent = _git("rev-parse", f"{commits[0]}^")
+            if parent.returncode != 0 or not (parent.stdout or "").strip():
+                raise RuntimeError(
+                    f"無法由任務 {task.get('id')} 第一個 commit 回填 baseline："
+                    f"{(parent.stderr or '').strip()}"
+                )
+            task["base_commit"] = (parent.stdout or "").strip()
+        elif task.get("status") == "in_progress":
+            # 沒有 commit 就沒有可驗證的實作；回到 pending，下一次 implement 會以當時 HEAD 建 baseline。
+            task["status"] = "pending"
+            task["last_verdict"] = "舊版中斷任務沒有可驗證 commit，已安全回到 pending"
+    data.pop("git_baselines_pending", None)
+    data["updated_at"] = _now()
+    return True
+
+
+def _failure_fingerprint(source, reason):
+    normalized = unicodedata.normalize("NFKC", reason or "").strip().lower()
+    normalized = re.sub(r"\s+", " ", normalized)
+    return f"{source}:{normalized}"
+
+
+def _record_task_failure(task, source, reason):
+    fingerprint = _failure_fingerprint(source, reason)
+    if fingerprint == task.get("last_failure_fingerprint"):
+        task["consecutive_same_failures"] = int(task.get("consecutive_same_failures") or 0) + 1
+    else:
+        task["last_failure_fingerprint"] = fingerprint
+        task["consecutive_same_failures"] = 1
+    return task["consecutive_same_failures"] >= 2
+
+
+class _ParsedTasks(list):
+    def __init__(self, tasks, summary):
+        super().__init__(tasks)
+        self.summary = summary
+
+
+def _validate_meeting_summary(raw, previous_summary=None):
+    if not isinstance(raw, dict):
+        return None
+    required = (
+        "source_message_watermark", "goal", "decisions", "non_goals",
+        "global_constraints", "acceptance_criteria", "open_questions",
+    )
+    if not all(key in raw for key in required):
+        return None
+    watermark = raw["source_message_watermark"]
+    if isinstance(watermark, bool) or not isinstance(watermark, int) or watermark < 0:
+        return None
+    if watermark > len(_messages):
+        return None
+    if previous_summary and watermark < previous_summary.get("source_message_watermark", 0):
+        return None
+    if not isinstance(raw["goal"], str) or not raw["goal"].strip():
+        return None
+    arrays = required[2:]
+    if any(not isinstance(raw[key], list) or not all(isinstance(v, str) for v in raw[key]) for key in arrays):
+        return None
+    return {key: raw[key] for key in required}
+
+
+def _parse_tasks(text, *, allow_empty=False, previous_summary=None):
     # 取最後一個 json 圍欄並嚴格驗證規格 §6.1；不做部分接受或自動修補。
     # done 任務的保留規則由消化棒呼叫端的 _merge_tasks 處理。
     matches = _JSON_FENCE_RE.findall(text or "")
@@ -1268,6 +1581,9 @@ def _parse_tasks(text, *, allow_empty=False):
     except (json.JSONDecodeError, TypeError):
         return None
     if not isinstance(data, dict):
+        return None
+    summary = _validate_meeting_summary(data.get("meeting_summary"), previous_summary)
+    if summary is None:
         return None
     tasks = data.get("tasks")
     if not isinstance(tasks, list) or (not tasks and not allow_empty):
@@ -1292,7 +1608,7 @@ def _parse_tasks(text, *, allow_empty=False):
             return None
         seen_ids.add(task_id)
         cleaned.append(t)
-    return cleaned
+    return _ParsedTasks(cleaned, summary)
 
 
 def _parse_verdict(text):
@@ -1332,7 +1648,8 @@ def _tasks_from_parsed(parsed):
         "id": t["id"], "title": t["title"],
         "files": t.get("files") or [], "acceptance": t.get("acceptance") or [],
         "status": "pending", "attempts": 0, "arbitrated": False,
-        "commits": [], "last_verdict": "",
+        "base_commit": "", "commits": [], "last_verdict": "",
+        "last_failure_fingerprint": "", "consecutive_same_failures": 0,
     } for t in parsed]
 
 
@@ -1353,12 +1670,88 @@ def _merge_tasks(existing, parsed):
             "attempts": (old or {}).get("attempts", 0),
             "arbitrated": (old or {}).get("arbitrated", False),
             "commits": list((old or {}).get("commits", [])),
+            "base_commit": (old or {}).get("base_commit", ""),
             "last_verdict": (old or {}).get("last_verdict", ""),
+            "last_failure_fingerprint": (old or {}).get("last_failure_fingerprint", ""),
+            "consecutive_same_failures": (old or {}).get("consecutive_same_failures", 0),
         })
+        if old and any(old.get(k) != t.get(k) for k in ("title", "files", "acceptance")):
+            merged[-1]["last_failure_fingerprint"] = ""
+            merged[-1]["consecutive_same_failures"] = 0
     return merged
 
 
-def _write_devlog(task_id, seat, stage, instruction, error=None):
+def _session_id_for_call(data, role, seat, task_id):
+    if role == "verifier" or not isinstance(data, dict):
+        return None
+    saved = (data.get("sessions") or {}).get(role)
+    if not isinstance(saved, dict):
+        return None
+    if saved.get("provider") != seat or saved.get("project_dir") != _project_dir:
+        return None
+    if saved.get("branch") != data.get("branch"):
+        return None
+    if role == "implementer" and saved.get("task_id") != task_id:
+        return None
+    value = saved.get("session_id")
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _normalize_adapter_result(value):
+    if isinstance(value, str):
+        return _adapter_result(value)
+    if not isinstance(value, dict) or not isinstance(value.get("text"), str) or not value["text"].strip():
+        raise RuntimeError("adapter 未回傳合法的結構化結果")
+    usage = value.get("usage") if isinstance(value.get("usage"), dict) else _unavailable_usage()
+    usage = {**_unavailable_usage(), **usage}
+    session = value.get("session") if isinstance(value.get("session"), dict) else {}
+    return {
+        "text": value["text"].strip(), "usage": usage,
+        "session": {
+            "id": session.get("id"), "resumed": bool(session.get("resumed")),
+            "resume_failed": bool(session.get("resume_failed")),
+            "persistence_fallback": bool(session.get("persistence_fallback")),
+        },
+    }
+
+
+def _record_usage_and_session(data, seat, role, task_id, result):
+    if not isinstance(data, dict):
+        return
+    data.setdefault("sessions", {})
+    session = result["session"]
+    session_id = session.get("id")
+    if role != "verifier" and isinstance(session_id, str) and session_id.strip():
+        data["sessions"][role] = {
+            "provider": seat, "session_id": session_id, "task_id": task_id if role == "implementer" else None,
+            "branch": data.get("branch"), "project_dir": _project_dir,
+        }
+    elif role == "implementer" and role in data["sessions"]:
+        saved = data["sessions"][role]
+        if saved.get("task_id") != task_id or saved.get("provider") != seat:
+            data["sessions"].pop(role, None)
+
+    state = data.setdefault("usage", _empty_usage_state())
+    usage = dict(result["usage"])
+    last = {"provider": seat, "role": role, **usage}
+    state["last"] = last
+    total = usage.get("total_tokens")
+    if isinstance(total, int):
+        state["known_total_tokens"] = int(state.get("known_total_tokens") or 0) + total
+        provider = state.setdefault("by_provider", {}).setdefault(seat, {
+            "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
+            "total_tokens": 0, "cost_usd": 0.0,
+        })
+        for key in ("input_tokens", "cached_input_tokens", "output_tokens", "total_tokens"):
+            if isinstance(usage.get(key), int):
+                provider[key] += usage[key]
+        if isinstance(usage.get("cost_usd"), (int, float)):
+            provider["cost_usd"] += usage["cost_usd"]
+    else:
+        state["incomplete"] = True
+
+
+def _write_devlog(task_id, seat, stage, instruction, error=None, metadata=None):
     global _devlog_seq
     _devlog_seq += 1
     info = _last_run.get(seat) or {}
@@ -1379,6 +1772,7 @@ def _write_devlog(task_id, seat, stage, instruction, error=None):
     ]
     if error:
         lines += ["", "=== error ===", error]
+    lines += ["", "metadata_json=" + json.dumps(metadata or {}, ensure_ascii=False, separators=(",", ":"))]
     tid = task_id if task_id is not None else 0
     # stamp 只到秒，管線快跑（尤其測試）可能同秒多棒，故加遞增序號避免檔名撞掉。
     path = DEVLOG_DIR / f"{_stamp()}-{_devlog_seq:04d}-task{tid}-{seat}-{stage}.log"
@@ -1390,15 +1784,44 @@ def _call_seat_checked(seat, instr, stage, task_id=None, dev_role=None, data=Non
     if data is not None and _dev_gate_or_pause():
         raise _PipelinePaused(_dev.get("pause_reason") or "gate")
     _last_run.pop(seat, None)
+    resume_id = _session_id_for_call(data, dev_role, seat, task_id)
+    result = None
     try:
-        text = ADAPTERS[seat](seat, instr, _option(seat), dev_role=dev_role, timeout=DEV_CALL_TIMEOUT)
+        try:
+            value = ADAPTERS[seat](seat, instr, _option(seat), dev_role=dev_role,
+                                   timeout=DEV_CALL_TIMEOUT, session_id=resume_id)
+        except Exception as first_error:
+            info = _last_run.get(seat) or {}
+            blob = f"{info.get('stdout', '')}\n{info.get('stderr', '')}\n{first_error}".lower()
+            invalid_session = resume_id and any(
+                noun in blob for noun in ("session", "thread", "conversation")) and any(
+                marker in blob for marker in ("not found", "expired", "invalid", "unknown", "不存在", "過期"))
+            if not invalid_session:
+                raise
+            _last_run.pop(seat, None)
+            value = ADAPTERS[seat](seat, instr, _option(seat), dev_role=dev_role,
+                                   timeout=DEV_CALL_TIMEOUT, session_id=None)
+            result = _normalize_adapter_result(value)
+            result["session"]["resume_failed"] = True
+        if result is None:
+            result = _normalize_adapter_result(value)
         info = _last_run.get(seat) or {}
         if info.get("returncode") not in (None, 0):
             raise RuntimeError(f"{seat} exit={info['returncode']}")
-        _write_devlog(task_id, seat, stage, instr)
-        return text
+        _record_usage_and_session(data, seat, dev_role, task_id, result)
+        _write_devlog(task_id, seat, stage, instr, metadata={
+            "usage": result["usage"], "session": result["session"], "role": dev_role,
+        })
+        return result["text"]
     except Exception as e:  # noqa: BLE001 - 先判斷是否為限流特徵，再決定要不要往外拋
-        _write_devlog(task_id, seat, stage, instr, error=str(e))
+        _write_devlog(task_id, seat, stage, instr, error=str(e), metadata={
+            "usage": _unavailable_usage(),
+            "session": {
+                "id": resume_id, "resumed": bool(resume_id), "resume_failed": False,
+                "persistence_fallback": False,
+            },
+            "role": dev_role,
+        })
         info = _last_run.get(seat) or {}
         blob = f"{info.get('stdout', '')}\n{info.get('stderr', '')}\n{e}".lower()
         if any(marker in blob for marker in RATE_LIMIT_MARKERS):
@@ -1421,6 +1844,35 @@ def _protocol_call(seat, instr, parse_fn, stage, task_id=None, dev_role=None, da
     return text2, parse_fn(text2)
 
 
+def _valid_saved_summary():
+    raw = _load_meeting_summary()
+    return _validate_meeting_summary(raw) if raw else None
+
+
+def _controller_context():
+    summary = _valid_saved_summary()
+    if summary is None:
+        return f"摘要不可用；請讀取完整 UTF-8 逐字稿重建：{MD_MIRROR}", None
+    watermark = summary["source_message_watermark"]
+    recent = _messages[watermark:]
+    return (
+        "現行會議摘要：\n" + json.dumps(summary, ensure_ascii=False, indent=1)
+        + "\n摘要水位後的新訊息：\n" + json.dumps(recent, ensure_ascii=False, indent=1),
+        summary,
+    )
+
+
+def _summary_projection():
+    summary = _valid_saved_summary()
+    if summary is None:
+        return "（會議摘要不可用；依任務簡報與專案規格文件判斷）"
+    return (
+        "相關決議：" + "; ".join(summary.get("decisions") or ["（無）"])
+        + "\n全域限制：" + "; ".join(summary.get("global_constraints") or ["（無）"])
+        + "\n全域驗收：" + "; ".join(summary.get("acceptance_criteria") or ["（無）"])
+    )
+
+
 def _dev_instruction(stage, **kw):
     # 上下文裁剪（規格 §5）：拆任務/仲裁/消化/收尾讀完整逐字稿；實作/驗證只讀固定小包裹。
     controller_disp = PARTICIPANTS[_dev_roles["controller"]]["display"]
@@ -1432,31 +1884,39 @@ def _dev_instruction(stage, **kw):
             f"3. 現行 tasks.json 內容如下（tasks 為空代表尚未拆過任務）：\n{kw['tasks_json']}\n"
             f"4. 請根據逐字稿中主持人交代的目標，拆出有序、可獨立驗收的任務清單，"
             f"每項包含 id（從 1 遞增整數）、title、files（涉及檔案路徑陣列）、acceptance（驗收條件陣列）。\n"
-            f"5. 輸出末尾必須包含且只包含一個下列格式的 json 圍欄：\n"
+            f"5. 同一份輸出也要建立會議摘要；source_message_watermark 應設為目前訊息數 {len(_messages)}。\n"
+            f"6. 輸出末尾必須包含且只包含一個下列格式的 json 圍欄：\n"
             f"{JSON_FENCE_OPEN}\n"
-            f'{{"tasks": [{{"id": 1, "title": "...", "files": ["..."], "acceptance": ["..."]}}]}}\n'
+            f'{{"meeting_summary": {{"source_message_watermark": {len(_messages)}, "goal": "...", '
+            f'"decisions": [], "non_goals": [], "global_constraints": [], "acceptance_criteria": [], '
+            f'"open_questions": []}}, "tasks": [{{"id": 1, "title": "...", "files": ["..."], "acceptance": ["..."]}}]}}\n'
             f"{JSON_FENCE_CLOSE}\n"
             f"用繁體中文書寫圍欄前的說明文字。絕對不要建立、修改或刪除任何檔案。"
         )
     if stage == "digest":
+        context, _ = _controller_context()
         return (
             f"你是開發模式管線的主控席「{controller_disp}」，負責消化主持人插話並修訂任務清單。\n"
-            f"1. 先讀取完整逐字稿（UTF-8）：{MD_MIRROR}——留意最新的主持人發言。\n"
+            f"1. 依下列裁剪後上下文處理；只有其中明示摘要不可用時才讀完整逐字稿：\n{context}\n"
             f"2. 專案目錄：{_project_dir}。\n"
             f"3. 現行 tasks.json 內容：\n{kw['tasks_json']}\n"
             f"4. 請依主持人最新發言修訂任務清單：已標記 status=done 的任務內容與狀態不可更動；"
             f"其餘可依插話內容新增、修改；輸出清單中缺少的未完成任務將被視為刪除。\n"
-            f"5. 輸出末尾必須包含且只包含一個下列格式的**完整**（非增量）json 圍欄：\n"
+            f"5. 同棒更新完整 meeting_summary，source_message_watermark 應設為目前訊息數 {len(_messages)}。\n"
+            f"6. 輸出末尾必須包含且只包含一個下列格式的**完整**（非增量）json 圍欄：\n"
             f"{JSON_FENCE_OPEN}\n"
-            f'{{"tasks": [{{"id": 1, "title": "...", "files": ["..."], "acceptance": ["..."]}}]}}\n'
+            f'{{"meeting_summary": {{"source_message_watermark": {len(_messages)}, "goal": "...", '
+            f'"decisions": [], "non_goals": [], "global_constraints": [], "acceptance_criteria": [], '
+            f'"open_questions": []}}, "tasks": [{{"id": 1, "title": "...", "files": ["..."], "acceptance": ["..."]}}]}}\n'
             f"{JSON_FENCE_CLOSE}\n"
             f"用繁體中文書寫圍欄前的說明文字。絕對不要建立、修改或刪除任何檔案。"
         )
     if stage == "arbitrate":
         task = kw["task"]
+        context, _ = _controller_context()
         return (
             f"你是開發模式管線的主控席「{controller_disp}」，負責仲裁一個連續失敗的任務。\n"
-            f"1. 先讀取完整逐字稿（UTF-8）：{MD_MIRROR}。\n"
+            f"1. 依下列裁剪後上下文處理；只有其中明示摘要不可用時才讀完整逐字稿：\n{context}\n"
             f"2. 專案目錄：{_project_dir}。\n"
             f"3. 現行 tasks.json 內容：\n{kw['tasks_json']}\n"
             f"4. 任務「{task['title']}」（id={task['id']}）已連續失敗 {task['attempts']} 次，"
@@ -1470,9 +1930,10 @@ def _dev_instruction(stage, **kw):
             f"用繁體中文。絕對不要建立、修改或刪除任何檔案。"
         )
     if stage == "handoff":
+        context, _ = _controller_context()
         return (
             f"你是開發模式管線的主控席「{controller_disp}」，管線即將結束，請寫交接摘要。\n"
-            f"1. 先讀取完整逐字稿（UTF-8）：{MD_MIRROR}。\n"
+            f"1. 依下列裁剪後上下文處理；只有其中明示摘要不可用時才讀完整逐字稿：\n{context}\n"
             f"2. 專案目錄：{_project_dir}。\n"
             f"3. 現行 tasks.json 內容：\n{kw['tasks_json']}\n"
             f"4. 請用繁體中文寫一段交接摘要：完成了什麼、哪些任務被跳過及原因、下次接手建議從哪裡開始。"
@@ -1491,6 +1952,7 @@ def _dev_instruction(stage, **kw):
             f"   標題：{task['title']}\n"
             f"   涉及檔案：{', '.join(task.get('files') or []) or '（未指定，依任務判斷）'}\n"
             f"   驗收條件：{'; '.join(task.get('acceptance') or [])}\n"
+            f"   適用的會議限制：\n{_summary_projection()}\n"
             f"4. 請直接動手建立/修改/刪除必要的檔案完成任務；完成後簡短說明你做了什麼變更即可，"
             f"不需要自己執行 git commit（伺服器會處理）。"
             f"{feedback_block}"
@@ -1500,17 +1962,28 @@ def _dev_instruction(stage, **kw):
         task = kw["task"]
         return (
             f"你是開發模式管線的驗證席，只能唯讀查閱，任務是驗收下列任務的實作是否通過。\n"
-            f"1. 專案目錄：{_project_dir}，可用唯讀 git 指令（如 git show、git diff、git log）自行查閱細節 diff。\n"
+            f"1. 專案目錄：{_project_dir}，只以指定 range 的最終 net diff 驗證；不得逐一重讀歷史 commits。\n"
             f"2. 本次任務簡報：\n"
             f"   標題：{task['title']}\n"
             f"   涉及檔案：{', '.join(task.get('files') or []) or '（未指定）'}\n"
             f"   驗收條件：{'; '.join(task.get('acceptance') or [])}\n"
-            f"3. 本次實作對應的 commit 與各自 stat：\n{kw['commits_block']}\n"
-            f"4. 請先比對 commit 變更的檔案與任務簡報範圍，凡動到與任務無關的檔案，"
+            f"   適用的會議限制：\n{_summary_projection()}\n"
+            f"3. 驗證 range：{kw['diff_range']}；最終 name-status／stat：\n{kw['diff_block']}\n"
+            f"4. 請先比對最終 net diff 與任務簡報範圍，凡最終仍動到與任務無關的檔案，"
             f"一律判定不通過並在原因中列出越界檔案；再檢查是否滿足所有驗收條件。\n"
             f"5. 輸出最後一行必須是（照抄格式，不要多加標點）：\n"
             f"{VERDICT_PASS}\n{VERDICT_FAIL_PREFIX}<一句話原因>\n"
             f"用繁體中文書寫理由段落。絕對不要建立、修改或刪除任何檔案。"
+        )
+    if stage == "integration_verify":
+        return (
+            f"你是開發模式管線的驗證席，只能唯讀查閱。請對整條管線做收尾整合驗收。\n"
+            f"1. 專案目錄：{_project_dir}。只看 {kw['diff_range']} 的最終 net diff，不重讀歷史 commits。\n"
+            f"2. 全部任務與驗收：\n{kw['tasks_json']}\n"
+            f"3. 最終 name-status／stat：\n{kw['diff_block']}\n"
+            f"4. 適用的會議限制：\n{_summary_projection()}\n"
+            f"5. 輸出最後一行必須是：\n{VERDICT_PASS}\n{VERDICT_FAIL_PREFIX}<一句話原因>\n"
+            f"用繁體中文。絕對不要建立、修改或刪除任何檔案。"
         )
     raise ValueError(f"unknown dev stage: {stage}")
 
@@ -1557,10 +2030,12 @@ def _dev_run_dispatch(data):
         _dev_pause_state(data, "parse_fail")
         append_message("system", "⛔ 主控拆任務輸出連續兩次不符協議格式，管線暫停。")
         return False
+    summary = {"version": 1, **parsed.summary, "updated_at": _now()}
     data["tasks"] = _tasks_from_parsed(parsed)
     data["dispatched"] = True
     data["status"] = "running"
     data["updated_at"] = _now()
+    _save_meeting_summary(summary)
     _save_tasks(data)
     return True
 
@@ -1570,6 +2045,8 @@ def _dev_run_implement(data, task):
         _dev["stage"] = "implement"
         _dev["current_task"] = task["id"]
     seat = _dev_roles["implementer"]
+    if not task.get("base_commit"):
+        task["base_commit"] = _git_head()
     task["attempts"] += 1
     task["status"] = "in_progress"
     data["updated_at"] = _now()
@@ -1596,6 +2073,11 @@ def _dev_run_implement(data, task):
         task["status"] = "pending"
         task["last_verdict"] = "無任何檔案變更"
         append_message("system", f"任務 {task['id']} 實作棒未產生任何檔案變更，記為本次嘗試失敗。")
+        repeated = _record_task_failure(task, "implement_no_change", task["last_verdict"])
+        if repeated:
+            _dev_pause_state(data, "repeated_failure")
+            append_message("system", f"⏸ 任務 {task['id']} 相同失敗連續出現第 2 次，管線暫停。")
+            return False
     else:
         task["commits"].append(commit)
     data["updated_at"] = _now()
@@ -1608,10 +2090,11 @@ def _dev_run_verify(data, task):
         _dev["stage"] = "verify"
         _dev["current_task"] = task["id"]
     seat = _dev_roles["verifier"]
-    commits_block = "\n\n".join(
-        f"commit {c}:\n{_git_show_stat(c)}" for c in task.get("commits", [])
-    ) or "（無 commit）"
-    instr = _dev_instruction("verify", task=task, commits_block=commits_block)
+    base_commit = task.get("base_commit")
+    if not base_commit:
+        raise RuntimeError(f"任務 {task['id']} 缺少 base_commit")
+    diff_range, diff_block = _git_diff_summary(base_commit)
+    instr = _dev_instruction("verify", task=task, diff_range=diff_range, diff_block=diff_block)
     text, verdict = _protocol_call(
         seat, instr, _parse_verdict, "verify", task_id=task["id"], dev_role="verifier", data=data)
     append_message(seat, text, sub=f"任務 {task['id']} · 驗證")
@@ -1625,6 +2108,11 @@ def _dev_run_verify(data, task):
     else:
         task["status"] = "pending"
         task["last_verdict"] = f"{VERDICT_FAIL_PREFIX}{verdict['reason']}"
+        repeated = _record_task_failure(task, "verify", verdict["reason"])
+        if repeated:
+            _dev_pause_state(data, "repeated_failure")
+            append_message("system", f"⏸ 任務 {task['id']} 相同驗證失敗連續出現第 2 次，管線暫停。")
+            return False
     data["updated_at"] = _now()
     _save_tasks(data)
     return True
@@ -1649,6 +2137,8 @@ def _dev_run_arbitration(data, task):
         task["attempts"] = 0
         task["status"] = "pending"
         task["last_verdict"] = f"{ARBITRATION_REASSIGN_PREFIX}{verdict['detail']}"
+        task["last_failure_fingerprint"] = ""
+        task["consecutive_same_failures"] = 0
         data["updated_at"] = _now()
         _save_tasks(data)
         return True
@@ -1674,14 +2164,57 @@ def _dev_run_digest(data):
     seat = _dev_roles["controller"]
     tasks_json = json.dumps(data, ensure_ascii=False, indent=1)
     instr = _dev_instruction("digest", tasks_json=tasks_json)
-    text, parsed = _protocol_call(seat, instr, lambda output: _parse_tasks(output, allow_empty=True),
+    previous_summary = _valid_saved_summary()
+    text, parsed = _protocol_call(
+        seat, instr, lambda output: _parse_tasks(
+            output, allow_empty=True, previous_summary=previous_summary),
                                   "digest", task_id=0, dev_role="controller", data=data)
     append_message(seat, text, sub="消化插話")
     if parsed is None:
         _dev_pause_state(data, "parse_fail")
         append_message("system", "⛔ 主控消化棒輸出連續兩次不符協議格式，管線暫停。")
         return False
+    summary = {"version": 1, **parsed.summary, "updated_at": _now()}
     data["tasks"] = _merge_tasks(data["tasks"], parsed)
+    data["updated_at"] = _now()
+    _save_meeting_summary(summary)
+    _save_tasks(data)
+    return True
+
+
+def _dev_run_integration_verify(data):
+    with _lock:
+        _dev["stage"] = "integration_verify"
+        _dev["current_task"] = None
+    seat = _dev_roles["verifier"]
+    main_commit = data.get("main_commit")
+    if not main_commit:
+        raise RuntimeError("tasks.json 缺少管線 main_commit")
+    diff_range, diff_block = _git_diff_summary(main_commit)
+    task_briefs = [{
+        key: task.get(key)
+        for key in ("id", "title", "files", "acceptance", "status", "last_verdict")
+    } for task in data.get("tasks", [])]
+    instr = _dev_instruction(
+        "integration_verify", diff_range=diff_range, diff_block=diff_block,
+        tasks_json=json.dumps(task_briefs, ensure_ascii=False, indent=1),
+    )
+    text, verdict = _protocol_call(
+        seat, instr, _parse_verdict, "integration-verify", task_id=0,
+        dev_role="verifier", data=data,
+    )
+    append_message(seat, text, sub="收尾 · 整合驗證")
+    if verdict is None:
+        _dev_pause_state(data, "parse_fail")
+        append_message("system", "⛔ 整合驗證輸出連續兩次不符協議格式，管線暫停。")
+        return False
+    if not verdict["passed"]:
+        data["integration_verdict"] = f"{VERDICT_FAIL_PREFIX}{verdict['reason']}"
+        _dev_pause_state(data, "integration_failed")
+        append_message("system", f"⏸ 收尾整合驗證不通過，管線暫停：{verdict['reason']}")
+        return False
+    data["integration_verified"] = True
+    data["integration_verdict"] = VERDICT_PASS
     data["updated_at"] = _now()
     _save_tasks(data)
     return True
@@ -1711,7 +2244,9 @@ def _dev_run_handoff(data):
 def _dev_next_action(data):
     """回傳 (action, task)：dispatch/handoff（無任務）或 implement/verify/arbitrate/auto_block（含任務）。"""
     if not data["tasks"]:
-        return ("handoff" if data.get("dispatched") else "dispatch"), None
+        if not data.get("dispatched"):
+            return "dispatch", None
+        return ("handoff" if data.get("integration_verified") else "integration_verify"), None
     for t in data["tasks"]:
         if t["status"] in ("done", "blocked"):
             continue
@@ -1722,7 +2257,7 @@ def _dev_next_action(data):
         if t["status"] == "in_progress":
             return "verify", t
         return "implement", t
-    return "handoff", None
+    return ("handoff" if data.get("integration_verified") else "integration_verify"), None
 
 
 def _dev_pre_gate():
@@ -1825,6 +2360,36 @@ def run_dev_pipeline(digest_first=False):
                     append_message("system", f"⛔ 管線發生未預期錯誤，已暫停：{e}")
                     _dev_pause_state(_load_tasks() or data, "seat_error")
                 return
+
+            if action == "integration_verify":
+                try:
+                    ok = _dev_run_integration_verify(data)
+                except _PipelinePaused:
+                    return
+                except _RateLimited:
+                    append_message("system", "⏸ 偵測到限流／用量上限特徵，管線暫停。")
+                    _dev_pause_state(_load_tasks() or data, "rate_limit")
+                    return
+                except Exception as e:
+                    append_message("system", f"⛔ 整合驗證發生錯誤，已暫停：{e}")
+                    _dev_pause_state(_load_tasks() or data, "seat_error")
+                    return
+                if not ok:
+                    return
+                outcome = _dev_post_gate(baseline)
+                if outcome == "stop":
+                    latest = _load_tasks()
+                    if latest is not None:
+                        _dev_pause_state(latest, "manual")
+                    return
+                if outcome == "digest":
+                    if _dev_gate_or_pause():
+                        return
+                    if not _dev_digest_step():
+                        return
+                    with _lock:
+                        baseline[0] = len(_messages)
+                continue
 
             try:
                 if action == "dispatch":
@@ -1933,6 +2498,12 @@ def _dev_start():
         except RuntimeError as e:
             append_message("system", f"⛔ 開發管線無法續作：{e}")
             return False, str(e)
+        try:
+            if _backfill_git_baselines(data):
+                _save_tasks(data)
+        except RuntimeError as e:
+            append_message("system", f"⛔ 開發管線無法續作：{e}")
+            return False, str(e)
         # 暫停期間的人類發言（含仲裁「詢問」後主持人的拍板）→ 續作第一棒先跑消化棒。
         # 舊檔或 crash 降級沒有水位紀錄（get 回 None）→ 保守起見有人類發言就先消化。
         watermark = data.get("message_watermark")
@@ -1957,10 +2528,12 @@ def _dev_start():
             append_message("system", f"⛔ 開發管線無法啟動：{e}")
             return False, str(e)
         data = {
-            "version": 1, "status": "running", "pause_reason": "",
+            "version": 2, "status": "running", "pause_reason": "",
             "branch": branch, "project_dir": _project_dir,
             "session_goal": latest, "turn_count": 0,
             "message_watermark": _latest_human_no(), "dispatched": False,
+            "main_commit": _git_head(), "integration_verified": False,
+            "sessions": {}, "usage": _empty_usage_state(),
             "updated_at": _now(), "tasks": [], "handoff": "",
         }
         _save_tasks(data)
@@ -2012,6 +2585,7 @@ def _dev_load_from_tasks():
     if not data:
         return
     _remember_loaded_tasks(data)
+    _remember_loaded_meeting_summary(_load_meeting_summary())
     with _lock:
         _dev["active"] = False
         _dev["paused"] = data.get("status") == "paused"
@@ -2033,6 +2607,7 @@ def _dev_payload():
         "pause_reason": _dev["pause_reason"], "stage": _dev["stage"],
         "current_task": _dev["current_task"], "task_total": total,
         "turn_count": _dev["turn_count"], "branch": _dev["branch"],
+        "usage": data.get("usage", _empty_usage_state()) if data else _empty_usage_state(),
     }
 
 
@@ -2539,4 +3114,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

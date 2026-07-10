@@ -26,6 +26,7 @@ class DevmodeTestCase(unittest.TestCase):
             "SETTINGS": self.data_dir / "settings.json",
             "SESSIONS": self.data_dir / "sessions.json",
             "TASKS_FILE": self.data_dir / "tasks.json",
+            "MEETING_SUMMARY_FILE": self.data_dir / "meeting_summary.json",
             "DEVLOG_DIR": self.data_dir / "devlogs",
             "_project_dir": str(self.project_dir),
             "_messages": [],
@@ -39,13 +40,14 @@ class DevmodeTestCase(unittest.TestCase):
             "_last_run": {},
             "_data_hashes": {},
             "_trusted_tasks": None,
+            "_trusted_meeting_summary": None,
             "_devlog_seq": 0,
             "ADAPTERS": dict(server.ADAPTERS),
         }
         self.patchers = [mock.patch.object(server, name, value) for name, value in replacements.items()]
         for patcher in self.patchers:
             patcher.start()
-        for path in (server.TRANSCRIPT, server.MD_MIRROR, server.TASKS_FILE):
+        for path in (server.TRANSCRIPT, server.MD_MIRROR, server.TASKS_FILE, server.MEETING_SUMMARY_FILE):
             server._record_hash(path)
 
     def tearDown(self):
@@ -65,11 +67,14 @@ class DevmodeTestCase(unittest.TestCase):
             "arbitrated": arbitrated,
             "commits": [],
             "last_verdict": "",
+            "base_commit": "",
+            "last_failure_fingerprint": "",
+            "consecutive_same_failures": 0,
         }
 
     def state(self, tasks=None, *, dispatched=True, status="running"):
         return {
-            "version": 1,
+            "version": 2,
             "status": status,
             "pause_reason": "",
             "branch": f"{server.DEV_BRANCH_PREFIX}test",
@@ -78,6 +83,10 @@ class DevmodeTestCase(unittest.TestCase):
             "turn_count": 0,
             "message_watermark": 0,
             "dispatched": dispatched,
+            "main_commit": "main-base",
+            "integration_verified": False,
+            "sessions": {},
+            "usage": server._empty_usage_state(),
             "updated_at": "now",
             "tasks": list(tasks or []),
             "handoff": "",
@@ -87,7 +96,18 @@ class DevmodeTestCase(unittest.TestCase):
     def fenced(tasks):
         return (
             f"{server.JSON_FENCE_OPEN}\n"
-            + json.dumps({"tasks": tasks}, ensure_ascii=False)
+            + json.dumps({
+                "meeting_summary": {
+                    "source_message_watermark": 0,
+                    "goal": "test goal",
+                    "decisions": [],
+                    "non_goals": [],
+                    "global_constraints": [],
+                    "acceptance_criteria": [],
+                    "open_questions": [],
+                },
+                "tasks": tasks,
+            }, ensure_ascii=False)
             + f"\n{server.JSON_FENCE_CLOSE}"
         )
 
@@ -95,10 +115,11 @@ class DevmodeTestCase(unittest.TestCase):
         queued = list(outputs)
         calls = calls if calls is not None else []
 
-        def fake(name, instruction, option, dev_role=None, timeout=None):
+        def fake(name, instruction, option, dev_role=None, timeout=None, session_id=None):
             calls.append({
                 "name": name, "instruction": instruction,
                 "dev_role": dev_role, "timeout": timeout,
+                "session_id": session_id,
             })
             value = queued.pop(0)
             if isinstance(value, BaseException):
@@ -165,7 +186,7 @@ class ProtocolParserTests(DevmodeTestCase):
         merged = server._merge_tasks([done, pending], [])
         self.assertEqual(merged, [done])
         data = self.state(merged, dispatched=True)
-        self.assertEqual(server._dev_next_action(data), ("handoff", None))
+        self.assertEqual(server._dev_next_action(data), ("integration_verify", None))
         self.assertEqual(
             server._dev_next_action(self.state([], dispatched=False)),
             ("dispatch", None),
@@ -233,7 +254,7 @@ class ProtocolExecutionTests(DevmodeTestCase):
         self.assertTrue(server._dev_run_digest(data))
 
         self.assertEqual(data["tasks"], [done])
-        self.assertEqual(server._dev_next_action(data), ("handoff", None))
+        self.assertEqual(server._dev_next_action(data), ("integration_verify", None))
         self.assertEqual(calls[0]["dev_role"], "controller")
         self.assertEqual(data["turn_count"], 1)
 
@@ -242,7 +263,7 @@ class ProtocolExecutionTests(DevmodeTestCase):
         data = self.state([task])
         server._save_tasks(data)
 
-        def limited(name, instruction, option, dev_role=None, timeout=None):
+        def limited(name, instruction, option, dev_role=None, timeout=None, session_id=None):
             server._last_run[name] = {
                 "args": ["fake"], "stdout": "", "stderr": "HTTP 429 rate limit",
                 "returncode": 1, "elapsed": 0.01,
@@ -250,8 +271,9 @@ class ProtocolExecutionTests(DevmodeTestCase):
             raise RuntimeError("adapter failed")
 
         server.ADAPTERS["agy"] = limited
-        with self.assertRaises(server._RateLimited):
-            server._dev_run_implement(data, task)
+        with mock.patch.object(server, "_git_head", return_value="base"):
+            with self.assertRaises(server._RateLimited):
+                server._dev_run_implement(data, task)
 
         self.assertEqual(task["attempts"], 0)
         self.assertEqual(task["status"], "pending")
@@ -314,6 +336,91 @@ class GitIntegrationTests(DevmodeTestCase):
         )
         self.assertEqual(self.git("rev-parse", "main").stdout.strip(), main_head)
         self.assertIsNone(server._git_commit_task(task, 2, "agy"))
+
+    def test_per_task_final_net_diff_excludes_prior_task_and_deleted_artifact(self):
+        self.init_git()
+        server._git_new_branch()
+        task1 = self.task(1)
+        (self.project_dir / "file1.py").write_text("one\n", encoding="utf-8")
+        server._git_commit_task(task1, 1, "agy")
+        task2_base = self.git("rev-parse", "HEAD").stdout.strip()
+
+        artifact = self.project_dir / "artifact.pyc"
+        artifact.write_bytes(b"temporary")
+        self.git("add", "artifact.pyc")
+        self.git("commit", "-m", "temporary artifact")
+        artifact.unlink()
+        (self.project_dir / "file2.py").write_text("two\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-m", "final task two")
+
+        diff_range, block = server._git_diff_summary(task2_base)
+        self.assertEqual(diff_range, f"{task2_base}...HEAD")
+        self.assertIn("file2.py", block)
+        self.assertNotIn("file1.py", block)
+        self.assertNotIn("artifact.pyc", block)
+
+    def test_integration_verify_uses_pipeline_main_final_diff(self):
+        main = self.init_git()
+        branch = server._git_new_branch()
+        (self.project_dir / "file1.py").write_text("done\n", encoding="utf-8")
+        self.git("add", "file1.py")
+        self.git("commit", "-m", "task")
+        task = self.task(1, status="done")
+        task["commits"] = ["secret-history-sha"]
+        data = self.state([task])
+        data["main_commit"] = main
+        data["branch"] = branch
+        server._save_tasks(data)
+        calls = self.install_adapter("codex", [server.VERDICT_PASS])
+
+        self.assertTrue(server._dev_run_integration_verify(data))
+
+        self.assertTrue(data["integration_verified"])
+        self.assertIn(f"{main}...HEAD", calls[0]["instruction"])
+        self.assertIn("file1.py", calls[0]["instruction"])
+        self.assertNotIn("git show --stat", calls[0]["instruction"])
+        self.assertNotIn("secret-history-sha", calls[0]["instruction"])
+
+    def test_v1_paused_resume_backfills_git_baselines_and_completes_verification(self):
+        main = self.init_git()
+        branch = server._git_new_branch()
+        (self.project_dir / "file1.py").write_text("legacy task\n", encoding="utf-8")
+        self.git("add", "file1.py")
+        self.git("commit", "-m", "legacy task commit")
+        task_commit = self.git("rev-parse", "--short", "HEAD").stdout.strip()
+
+        task = self.task(1, status="in_progress", attempts=1)
+        task["commits"] = [task_commit]
+        task.pop("base_commit")
+        task.pop("last_failure_fingerprint")
+        task.pop("consecutive_same_failures")
+        legacy = self.state([task], status="paused")
+        legacy["version"] = 1
+        legacy["branch"] = branch
+        for key in ("main_commit", "integration_verified", "sessions", "usage"):
+            legacy.pop(key)
+        server.TASKS_FILE.write_text(json.dumps(legacy), encoding="utf-8")
+        server._record_hash(server.TASKS_FILE)
+
+        started = server.threading.Event()
+        with mock.patch.object(server, "run_dev_pipeline", side_effect=lambda **kwargs: started.set()):
+            ok, reason = server._dev_start()
+        self.assertTrue(ok, reason)
+        self.assertTrue(started.wait(2))
+
+        resumed = server._load_tasks()
+        self.assertEqual(resumed["version"], 2)
+        self.assertEqual(resumed["main_commit"], main)
+        self.assertEqual(resumed["tasks"][0]["base_commit"], main)
+        self.assertNotIn("git_baselines_pending", resumed)
+
+        self.install_adapter("codex", [server.VERDICT_PASS, server.VERDICT_PASS])
+        resumed_task = resumed["tasks"][0]
+        self.assertTrue(server._dev_run_verify(resumed, resumed_task))
+        self.assertEqual(server._dev_next_action(resumed), ("integration_verify", None))
+        self.assertTrue(server._dev_run_integration_verify(resumed))
+        self.assertEqual(server._dev_next_action(resumed), ("handoff", None))
 
     def test_resume_resets_turn_count_and_persists_leftover_commit(self):
         self.init_git()
@@ -410,7 +517,7 @@ class GitIntegrationTests(DevmodeTestCase):
         data["branch"] = branch
         server._save_tasks(data)
 
-        def interrupted(name, instruction, option, dev_role=None, timeout=None):
+        def interrupted(name, instruction, option, dev_role=None, timeout=None, session_id=None):
             (self.project_dir / "file1.py").write_text("partial = True\n", encoding="utf-8")
             server._last_run[name] = {
                 "args": ["fake"], "stdout": "", "stderr": "429 rate limit",
@@ -491,7 +598,7 @@ class SafetyAndAdapterTests(DevmodeTestCase):
         server._save_tasks(data)
         server.append_message("system", "baseline")
 
-        def tampering(name, instruction, option, dev_role=None, timeout=None):
+        def tampering(name, instruction, option, dev_role=None, timeout=None, session_id=None):
             server.MD_MIRROR.write_text("tampered", encoding="utf-8")
             return self.fenced([valid])
 
@@ -509,11 +616,14 @@ class SafetyAndAdapterTests(DevmodeTestCase):
         server._save_tasks(data)
         calls = self.install_adapter("codex", [server.VERDICT_PASS])
 
-        self.assertTrue(server._dev_run_verify(data, task))
+        with mock.patch.object(server, "_git_diff_summary", return_value=("base...HEAD", "final diff")):
+            task["base_commit"] = "base"
+            self.assertTrue(server._dev_run_verify(data, task))
 
         self.assertEqual(calls[0]["dev_role"], "verifier")
         self.assertIn("越界", calls[0]["instruction"])
-        self.assertIn("commit", calls[0]["instruction"])
+        self.assertIn("base...HEAD", calls[0]["instruction"])
+        self.assertNotIn("git show --stat", calls[0]["instruction"])
         self.assertEqual(task["status"], "done")
         self.assertEqual(data["turn_count"], 1)
 
@@ -543,13 +653,20 @@ class SafetyAndAdapterTests(DevmodeTestCase):
 
         def fake_claude_run(name, args, **kwargs):
             claude_calls.append((args, kwargs))
-            return subprocess.CompletedProcess(args, 0, "done", "")
+            payload = {"result": "done", "session_id": "claude-session", "usage": {
+                "input_tokens": 10, "output_tokens": 2,
+            }}
+            return subprocess.CompletedProcess(args, 0, json.dumps(payload), "")
 
         with mock.patch.object(server, "_find_claude", return_value="claude.exe"):
             with mock.patch.object(server, "_run_process", side_effect=fake_claude_run):
                 server._call_claude(
                     "claude", "instruction", server._option("claude"),
                     dev_role="controller", timeout=server.DEV_CALL_TIMEOUT,
+                )
+                server._call_claude(
+                    "claude", "instruction", server._option("claude"),
+                    dev_role="verifier", timeout=server.DEV_CALL_TIMEOUT,
                 )
 
         claude_args, claude_kwargs = claude_calls[0]
@@ -559,14 +676,21 @@ class SafetyAndAdapterTests(DevmodeTestCase):
         self.assertNotIn("WebSearch", claude_args)
         self.assertEqual(claude_kwargs["cwd"], str(self.project_dir))
         self.assertEqual(claude_kwargs["timeout"], server.DEV_CALL_TIMEOUT)
+        self.assertIn("--output-format", claude_args)
+        self.assertIn("--no-session-persistence", claude_calls[1][0])
 
         codex_calls = []
 
         def fake_codex_run(name, args, **kwargs):
             codex_calls.append((args, kwargs))
-            output_path = Path(args[args.index("-o") + 1])
-            output_path.write_text("done", encoding="utf-8")
-            return subprocess.CompletedProcess(args, 0, "", "")
+            events = [
+                {"type": "thread.started", "thread_id": "codex-session"},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+                {"type": "turn.completed", "usage": {
+                    "input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 2,
+                }},
+            ]
+            return subprocess.CompletedProcess(args, 0, "\n".join(json.dumps(e) for e in events), "")
 
         with mock.patch.object(server, "_run_process", side_effect=fake_codex_run):
             server._call_codex(
@@ -577,13 +701,14 @@ class SafetyAndAdapterTests(DevmodeTestCase):
         codex_args, codex_kwargs = codex_calls[0]
         sandbox_index = codex_args.index("--sandbox")
         self.assertEqual(codex_args[sandbox_index + 1], "read-only")
+        self.assertIn("--ephemeral", codex_args)
         self.assertEqual(codex_kwargs["timeout"], server.DEV_CALL_TIMEOUT)
 
     def test_devlog_contains_full_process_record(self):
         data = self.state([self.task()])
         server._save_tasks(data)
 
-        def fake(name, instruction, option, dev_role=None, timeout=None):
+        def fake(name, instruction, option, dev_role=None, timeout=None, session_id=None):
             server._last_run[name] = {
                 "args": ["fake", "--sandbox", "read-only"],
                 "stdout": "full stdout",
@@ -708,6 +833,277 @@ class DevPayloadTests(DevmodeTestCase):
         server._dev_roles.update(
             {"verifier": "codex", "implementer": "agy", "controller": "claude"})
         self.assertFalse(server._dev_roles_custom())
+
+
+class D4FeatureTests(DevmodeTestCase):
+    def usage_result(self, text="reply", session_id=None, total=12):
+        return server._adapter_result(
+            text,
+            {
+                "source": "cli_json", "input_tokens": 7, "cached_input_tokens": 3,
+                "output_tokens": 2, "total_tokens": total, "cost_usd": None,
+            },
+            session_id,
+        )
+
+    def test_v1_tasks_migrate_without_losing_progress(self):
+        legacy = self.state([self.task(status="in_progress", attempts=2)])
+        legacy["version"] = 1
+        legacy.pop("sessions")
+        legacy.pop("usage")
+        legacy["tasks"][0].pop("base_commit")
+        server.TASKS_FILE.write_text(json.dumps(legacy), encoding="utf-8")
+        server._record_hash(server.TASKS_FILE)
+
+        loaded = server._load_tasks()
+
+        self.assertEqual(loaded["version"], 2)
+        self.assertEqual(loaded["branch"], legacy["branch"])
+        self.assertEqual(loaded["tasks"][0]["attempts"], 2)
+        self.assertEqual(loaded["tasks"][0]["status"], "in_progress")
+        self.assertIn("sessions", loaded)
+        self.assertIn("usage", loaded)
+        self.assertEqual(json.loads(server.TASKS_FILE.read_text(encoding="utf-8"))["version"], 2)
+        self.assertTrue(server._check_tamper())
+
+    def test_structured_codex_and_claude_usage_parsing(self):
+        codex_events = [
+            {"type": "thread.started", "thread_id": "codex-id"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "answer"}},
+            {"type": "turn.completed", "usage": {
+                "input_tokens": 20, "cached_input_tokens": 8, "output_tokens": 5,
+            }},
+        ]
+        codex = server._codex_json_result("\n".join(json.dumps(e) for e in codex_events))
+        self.assertEqual(codex["text"], "answer")
+        self.assertEqual(codex["session"]["id"], "codex-id")
+        self.assertEqual(codex["usage"]["input_tokens"], 12)
+        self.assertEqual(codex["usage"]["total_tokens"], 25)
+
+        claude = server._claude_json_result(json.dumps({
+            "result": "answer", "session_id": "claude-id", "total_cost_usd": 0.02,
+            "usage": {
+                "input_tokens": 10, "cache_creation_input_tokens": 3,
+                "cache_read_input_tokens": 4, "output_tokens": 2,
+            },
+        }))
+        self.assertEqual(claude["session"]["id"], "claude-id")
+        self.assertEqual(claude["usage"]["cached_input_tokens"], 7)
+        self.assertEqual(claude["usage"]["total_tokens"], 19)
+        self.assertEqual(claude["usage"]["cost_usd"], 0.02)
+
+    def test_summary_is_strict_atomic_and_tamper_protected(self):
+        valid_task = {"id": 1, "title": "x", "files": [], "acceptance": ["ok"]}
+        parsed = server._parse_tasks(self.fenced([valid_task]))
+        self.assertIsNotNone(parsed)
+        summary = {"version": 1, **parsed.summary, "updated_at": "now"}
+        server._save_meeting_summary(summary)
+        self.assertTrue(server._check_tamper())
+
+        bad = json.loads(json.dumps({"meeting_summary": parsed.summary, "tasks": [valid_task]}))
+        bad["meeting_summary"]["source_message_watermark"] = 1
+        wrapped = f"{server.JSON_FENCE_OPEN}\n{json.dumps(bad)}\n{server.JSON_FENCE_CLOSE}"
+        self.assertIsNone(server._parse_tasks(wrapped))
+        self.assertEqual(server._load_meeting_summary()["source_message_watermark"], 0)
+
+        server.MEETING_SUMMARY_FILE.write_text("{}", encoding="utf-8")
+        self.assertEqual(server._dev_pre_gate(), "tamper")
+
+    def test_summary_context_is_selective_and_archived_with_meeting(self):
+        summary = {
+            "version": 1, "source_message_watermark": 0, "goal": "goal",
+            "decisions": ["decision"], "non_goals": [],
+            "global_constraints": ["no deps"], "acceptance_criteria": ["tests pass"],
+            "open_questions": [], "updated_at": "now",
+        }
+        server._save_meeting_summary(summary)
+        task = self.task()
+        implement = server._dev_instruction("implement", task=task)
+        digest = server._dev_instruction("digest", tasks_json="{}")
+        self.assertIn("no deps", implement)
+        self.assertNotIn(str(server.MEETING_SUMMARY_FILE), implement)
+        self.assertNotIn(str(server.MD_MIRROR), implement)
+        self.assertIn("decision", digest)
+        self.assertNotIn(str(server.MD_MIRROR), digest)
+
+        server.append_message("你", "goal", role="host", name="HOST")
+        server._save_tasks(self.state([task], status="done"))
+        entry = server._archive_active_session()
+        self.assertTrue(entry["meeting_summary_path"])
+        self.assertTrue((self.data_dir / entry["meeting_summary_path"]).exists())
+
+    def test_same_failure_second_time_pauses_even_after_new_attempt(self):
+        task = self.task(status="in_progress", attempts=1)
+        task["base_commit"] = "base"
+        data = self.state([task])
+        server._save_tasks(data)
+        self.install_adapter("codex", [
+            server.VERDICT_FAIL_PREFIX + " Missing   Test ",
+            server.VERDICT_FAIL_PREFIX + "missing test",
+        ])
+
+        with mock.patch.object(server, "_git_diff_summary", return_value=("base...HEAD", "diff")):
+            self.assertTrue(server._dev_run_verify(data, task))
+            task["status"] = "in_progress"
+            task["attempts"] += 1
+            task["commits"].append("newcommit")
+            self.assertFalse(server._dev_run_verify(data, task))
+
+        self.assertEqual(data["status"], "paused")
+        self.assertEqual(data["pause_reason"], "repeated_failure")
+        self.assertEqual(task["consecutive_same_failures"], 2)
+
+    def test_session_policy_usage_and_resume_fallback(self):
+        calls = []
+
+        def fake(name, instruction, option, dev_role=None, timeout=None, session_id=None):
+            calls.append((dev_role, session_id))
+            return self.usage_result(session_id="controller-id")
+
+        server.ADAPTERS["claude"] = fake
+        data = self.state([self.task()])
+        server._save_tasks(data)
+        server._call_seat_checked("claude", "one", "dispatch", 0, "controller", data)
+        server._call_seat_checked("claude", "two", "digest", 0, "controller", data)
+        self.assertEqual(calls, [("controller", None), ("controller", "controller-id")])
+        self.assertEqual(data["usage"]["known_total_tokens"], 24)
+        self.assertEqual(data["usage"]["by_provider"]["claude"]["total_tokens"], 24)
+
+        implement_calls = []
+        server.ADAPTERS["agy"] = lambda name, instruction, option, dev_role=None, timeout=None, session_id=None: (
+            implement_calls.append((task_id := (1 if instruction != "task2" else 2), session_id))
+            or self.usage_result(session_id=f"implement-{task_id}"))
+        server._call_seat_checked("agy", "task1", "implement", 1, "implementer", data)
+        server._call_seat_checked("agy", "task1", "implement", 1, "implementer", data)
+        server._call_seat_checked("agy", "task2", "implement", 2, "implementer", data)
+        self.assertEqual(implement_calls, [(1, None), (1, "implement-1"), (2, None)])
+
+        verifier_calls = []
+        server.ADAPTERS["codex"] = lambda name, instruction, option, dev_role=None, timeout=None, session_id=None: (
+            verifier_calls.append(session_id) or self.usage_result(session_id="ignored"))
+        server._call_seat_checked("codex", "verify", "verify", 1, "verifier", data)
+        server._call_seat_checked("codex", "verify", "verify", 1, "verifier", data)
+        self.assertEqual(verifier_calls, [None, None])
+        self.assertNotIn("verifier", data["sessions"])
+
+        data["sessions"]["controller"] = {
+            "provider": "claude", "session_id": "expired", "task_id": None,
+            "branch": data["branch"], "project_dir": str(self.project_dir),
+        }
+        fallback_calls = []
+
+        def fallback(name, instruction, option, dev_role=None, timeout=None, session_id=None):
+            fallback_calls.append(session_id)
+            if session_id:
+                server._last_run[name] = {"stderr": "thread abc not found", "returncode": 1}
+                raise RuntimeError("thread abc not found")
+            return self.usage_result(session_id="fresh")
+
+        server.ADAPTERS["claude"] = fallback
+        server._call_seat_checked("claude", "resume", "digest", 0, "controller", data)
+        self.assertEqual(fallback_calls, ["expired", None])
+        metadata_line = [line for line in sorted(server.DEVLOG_DIR.glob("*.log"))[-1].read_text(
+            encoding="utf-8").splitlines() if line.startswith("metadata_json=")][0]
+        metadata = json.loads(metadata_line.split("=", 1)[1])
+        self.assertTrue(metadata["session"]["resume_failed"])
+
+    def test_codex_fresh_persistence_failure_falls_back_ephemeral_without_saving_id(self):
+        calls = []
+        events = [
+            {"type": "thread.started", "thread_id": "unusable-thread"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "answer"}},
+            {"type": "turn.completed", "usage": {
+                "input_tokens": 8, "cached_input_tokens": 3, "output_tokens": 2,
+            }},
+        ]
+
+        def fake_run(name, args, **kwargs):
+            calls.append(list(args))
+            if len(calls) == 1:
+                return subprocess.CompletedProcess(
+                    args, 1, "", "failed to record rollout items: thread unusable-thread not found")
+            return subprocess.CompletedProcess(
+                args, 0, "\n".join(json.dumps(event) for event in events), "")
+
+        data = self.state([self.task()])
+        server._save_tasks(data)
+        with mock.patch.object(server, "_run_process", side_effect=fake_run):
+            text = server._call_seat_checked(
+                "codex", "controller prompt", "dispatch", 0, "controller", data)
+
+        self.assertEqual(text, "answer")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("--ephemeral", calls[0])
+        self.assertIn("--ephemeral", calls[1])
+        self.assertNotIn("controller", data["sessions"])
+        metadata_line = [line for line in next(server.DEVLOG_DIR.glob("*.log")).read_text(
+            encoding="utf-8").splitlines() if line.startswith("metadata_json=")][0]
+        metadata = json.loads(metadata_line.split("=", 1)[1])
+        self.assertIsNone(metadata["session"]["id"])
+        self.assertFalse(metadata["session"]["resumed"])
+        self.assertTrue(metadata["session"]["persistence_fallback"])
+
+    def test_codex_usage_limit_with_secondary_thread_error_does_not_retry(self):
+        calls = []
+        stdout = json.dumps({
+            "type": "turn.failed",
+            "error": {"message": "You've hit your usage limit. Try again later."},
+        })
+        stderr = "failed to record rollout items: thread secondary not found"
+
+        def fake_run(name, args, **kwargs):
+            calls.append(list(args))
+            server._last_run[name] = {
+                "args": list(args), "stdout": stdout, "stderr": stderr,
+                "returncode": 1, "elapsed": 0.01,
+            }
+            return subprocess.CompletedProcess(args, 1, stdout, stderr)
+
+        task = self.task()
+        data = self.state([task])
+        server._save_tasks(data)
+        server._dev_roles["implementer"] = "codex"
+        with mock.patch.object(server, "_run_process", side_effect=fake_run):
+            with mock.patch.object(server, "_git_head", return_value="base"):
+                with self.assertRaises(server._RateLimited):
+                    server._dev_run_implement(data, task)
+
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("--ephemeral", calls[0])
+        self.assertEqual(task["attempts"], 0)
+
+    def test_dev_payload_exposes_known_usage(self):
+        data = self.state([self.task()])
+        data["usage"] = {
+            "last": {"provider": "codex", "total_tokens": 9},
+            "by_provider": {"codex": {"total_tokens": 9}},
+            "known_total_tokens": 9,
+            "incomplete": True,
+        }
+        server._save_tasks(data)
+        with mock.patch.object(server, "DEVMODE", True):
+            payload = server._dev_payload()
+        self.assertEqual(payload["usage"]["known_total_tokens"], 9)
+        self.assertTrue(payload["usage"]["incomplete"])
+
+    def test_interjection_during_integration_verify_is_digested_before_handoff(self):
+        data = self.state([self.task(status="done")])
+        data["integration_verified"] = False
+        server._save_tasks(data)
+
+        def integration_with_interjection(current):
+            current["integration_verified"] = True
+            server._save_tasks(current)
+            server.append_message("你", "收尾前請補一項", role="host", name="HOST")
+            return True
+
+        with mock.patch.object(server, "_dev_run_integration_verify", side_effect=integration_with_interjection):
+            with mock.patch.object(server, "_dev_digest_step", return_value=False) as digest:
+                with mock.patch.object(server, "_dev_run_handoff") as handoff:
+                    server.run_dev_pipeline()
+
+        digest.assert_called_once()
+        handoff.assert_not_called()
 
 
 if __name__ == "__main__":
