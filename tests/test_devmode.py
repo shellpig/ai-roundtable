@@ -159,6 +159,26 @@ class ProtocolParserTests(DevmodeTestCase):
                 self.assertIsNone(server._parse_tasks(self.fenced([item]), allow_empty=True))
         self.assertIsNone(server._parse_tasks(self.fenced([valid, dict(valid)])))
 
+    def test_integration_gate_schema_is_typed_and_rejects_unsafe_values(self):
+        summary = {
+            "source_message_watermark": 0, "goal": "goal", "decisions": [], "non_goals": [],
+            "global_constraints": [], "acceptance_criteria": [], "open_questions": [],
+        }
+        summary["integration_gates"] = [
+            {"kind": server.INTEGRATION_GATE_UNITTEST},
+            {"kind": server.INTEGRATION_GATE_MODULE, "module": "transcript_tool.cli", "args": ["roundtable.md"]},
+        ]
+        parsed = server._validate_meeting_summary(summary)
+        self.assertEqual(parsed["integration_gates"], summary["integration_gates"])
+        for invalid in (
+            [{"kind": "shell", "args": ["dir"]}],
+            [{"kind": server.INTEGRATION_GATE_MODULE, "module": "x;bad", "args": []}],
+            [{"kind": server.INTEGRATION_GATE_MODULE, "module": "tool.cli", "args": ["..\\secret"]}],
+        ):
+            with self.subTest(invalid=invalid):
+                candidate = dict(summary, integration_gates=invalid)
+                self.assertIsNone(server._validate_meeting_summary(candidate))
+
     def test_verdict_and_arbitration_require_nonempty_detail(self):
         self.assertEqual(server._parse_verdict(server.VERDICT_PASS), {"passed": True, "reason": ""})
         self.assertEqual(
@@ -397,6 +417,47 @@ class GitIntegrationTests(DevmodeTestCase):
         self.assertIn("file1.py", calls[0]["instruction"])
         self.assertNotIn("git show --stat", calls[0]["instruction"])
         self.assertNotIn("secret-history-sha", calls[0]["instruction"])
+
+    def test_integration_gate_evidence_is_recorded_and_forwarded(self):
+        main = self.init_git()
+        branch = server._git_new_branch()
+        (self.project_dir / "file1.py").write_text("done\n", encoding="utf-8")
+        self.git("add", "file1.py")
+        self.git("commit", "-m", "task")
+        python = self.project_dir / ".venv" / "Scripts" / "python.exe"
+        python.parent.mkdir(parents=True)
+        python.touch()
+        summary = {
+            "version": 1, "source_message_watermark": 0, "goal": "goal", "decisions": [],
+            "non_goals": [], "global_constraints": [], "acceptance_criteria": [], "open_questions": [],
+            "integration_gates": [{"kind": server.INTEGRATION_GATE_UNITTEST}], "updated_at": "now",
+        }
+        server._save_meeting_summary(summary)
+        data = self.state([self.task(1, status="done")])
+        data["main_commit"] = main
+        data["branch"] = branch
+        server._save_tasks(data)
+        calls = self.install_adapter("codex", [server.VERDICT_PASS, server.VERDICT_PASS])
+        with mock.patch.object(server, "_run_process", return_value=subprocess.CompletedProcess([], 0, "gate passed", "")) as run:
+            self.assertTrue(server._dev_run_integration_verify(data))
+        self.assertEqual(data["integration_gate_results"][0]["status"], "passed")
+        self.assertIn("gate passed", calls[0]["instruction"])
+        self.assertEqual(run.call_args.args[1][1:5], ["-m", "unittest", "discover", "-s"])
+        with mock.patch.object(server, "_run_process", return_value=subprocess.CompletedProcess([], 1, "", "gate failed")):
+            self.assertFalse(server._dev_run_integration_verify(data))
+        self.assertEqual(data["pause_reason"], "integration_gate_failed")
+
+    def test_integration_gate_reports_failure_and_missing_venv(self):
+        gate = {"kind": server.INTEGRATION_GATE_UNITTEST}
+        self.assertEqual(server._run_integration_gates([gate])[0]["status"], "blocked")
+        python = self.project_dir / ".venv" / "Scripts" / "python.exe"
+        python.parent.mkdir(parents=True)
+        python.touch()
+        with mock.patch.object(server, "_run_process", return_value=subprocess.CompletedProcess([], 1, "", "test failed")):
+            result = server._run_integration_gates([gate])[0]
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["returncode"], 1)
+        self.assertEqual(result["stderr_tail"], "test failed")
 
     def test_v1_paused_resume_backfills_git_baselines_and_completes_verification(self):
         main = self.init_git()

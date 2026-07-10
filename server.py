@@ -56,6 +56,10 @@ DEVMODE = os.environ.get("AI_ROUNDTABLE_DEVMODE") == "1"
 DEV_CALL_TIMEOUT = int(os.environ.get("AI_ROUNDTABLE_DEV_TIMEOUT", "3600"))   # 開發模式單棒上限（秒）
 DEV_MAX_TURNS = int(os.environ.get("AI_ROUNDTABLE_DEV_MAX_TURNS", "40"))      # 整場總棒數上限
 DEV_MAX_ATTEMPTS = 3            # 單任務重試上限（規格 §5）
+DEV_INTEGRATION_GATE_TIMEOUT = int(os.environ.get("AI_ROUNDTABLE_INTEGRATION_GATE_TIMEOUT", "600"))
+INTEGRATION_GATE_OUTPUT_TAIL = 2000
+INTEGRATION_GATE_UNITTEST = "python_unittest_discover"
+INTEGRATION_GATE_MODULE = "python_module"
 DEV_BRANCH_PREFIX = "roundtable/dev-"
 TASKS_FILE = DATA / "tasks.json"
 MEETING_SUMMARY_FILE = DATA / "meeting_summary.json"
@@ -1305,6 +1309,9 @@ def _migrate_tasks(data):
     if "integration_verified" not in data:
         data["integration_verified"] = False
         changed = True
+    if "integration_gate_results" not in data:
+        data["integration_gate_results"] = []
+        changed = True
     if "main_commit" not in data:
         data["main_commit"] = ""
         data["git_baselines_pending"] = True
@@ -1546,6 +1553,69 @@ class _ParsedTasks(list):
         self.summary = summary
 
 
+def _integration_gate_result(gate, status, *, command=None, returncode=None, stdout="", stderr="", elapsed=None):
+    return {
+        "gate": gate,
+        "status": status,
+        "command": command or [],
+        "returncode": returncode,
+        "stdout_tail": (stdout or "")[-INTEGRATION_GATE_OUTPUT_TAIL:],
+        "stderr_tail": (stderr or "")[-INTEGRATION_GATE_OUTPUT_TAIL:],
+        "elapsed": elapsed,
+    }
+
+
+def _run_integration_gates(gates):
+    project = Path(_project_dir)
+    python = project / ".venv" / "Scripts" / "python.exe"
+    results = []
+    for gate in gates:
+        if not python.is_file():
+            results.append(_integration_gate_result(gate, "blocked", stderr="找不到專案 .venv\\Scripts\\python.exe"))
+            continue
+        if gate["kind"] == INTEGRATION_GATE_UNITTEST:
+            command = [str(python), "-m", "unittest", "discover", "-s", "tests"]
+        else:
+            command = [str(python), "-m", gate["module"], *gate["args"]]
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        try:
+            completed = _run_process("integration-gate", command, stdin=subprocess.DEVNULL, cwd=str(project), env=env, timeout=DEV_INTEGRATION_GATE_TIMEOUT)
+            details = _last_run.get("integration-gate", {})
+            results.append(_integration_gate_result(
+                gate, "passed" if completed.returncode == 0 else "failed",
+                command=[str(Path(".venv") / "Scripts" / "python.exe"), *command[1:]],
+                returncode=completed.returncode, stdout=completed.stdout, stderr=completed.stderr,
+                elapsed=details.get("elapsed")))
+        except Exception as exc:  # noqa: BLE001 - gate 啟動失敗需成為整合驗收證據
+            results.append(_integration_gate_result(gate, "blocked", command=command[1:], stderr=str(exc)))
+    return results
+
+def _validate_integration_gates(raw):
+    if not isinstance(raw, list) or len(raw) > 8:
+        return None
+    cleaned = []
+    for gate in raw:
+        if not isinstance(gate, dict) or not isinstance(gate.get("kind"), str):
+            return None
+        if gate["kind"] == INTEGRATION_GATE_UNITTEST:
+            if set(gate) != {"kind"}:
+                return None
+            cleaned.append({"kind": INTEGRATION_GATE_UNITTEST})
+            continue
+        if gate["kind"] != INTEGRATION_GATE_MODULE or set(gate) != {"kind", "module", "args"}:
+            return None
+        module = gate["module"]
+        args = gate["args"]
+        if (not isinstance(module, str) or not re.fullmatch(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)*", module)
+                or not isinstance(args, list) or len(args) > 16
+                or not all(isinstance(arg, str) and arg and len(arg) <= 256 for arg in args)):
+            return None
+        if any(Path(arg).is_absolute() or ".." in Path(arg).parts for arg in args):
+            return None
+        cleaned.append({"kind": INTEGRATION_GATE_MODULE, "module": module, "args": list(args)})
+    return cleaned
+
 def _validate_meeting_summary(raw, previous_summary=None):
     if not isinstance(raw, dict):
         return None
@@ -1564,10 +1634,13 @@ def _validate_meeting_summary(raw, previous_summary=None):
         return None
     if not isinstance(raw["goal"], str) or not raw["goal"].strip():
         return None
+    integration_gates = _validate_integration_gates(raw.get("integration_gates", []))
+    if integration_gates is None:
+        return None
     arrays = required[2:]
     if any(not isinstance(raw[key], list) or not all(isinstance(v, str) for v in raw[key]) for key in arrays):
         return None
-    return {key: raw[key] for key in required}
+    return {**{key: raw[key] for key in required}, "integration_gates": integration_gates}
 
 
 def _parse_tasks(text, *, allow_empty=False, previous_summary=None):
@@ -1909,7 +1982,9 @@ def _dev_instruction(stage, **kw):
             f"4. 請根據逐字稿中主持人交代的目標，拆出有序、可獨立驗收的任務清單，"
             f"每項包含 id（從 1 遞增整數）、title、files（涉及檔案路徑陣列）、acceptance（驗收條件陣列）。\n"
             f"5. 同一份輸出也要建立會議摘要；source_message_watermark 應設為目前訊息數 {len(_messages)}。\n"
-            f"6. 輸出末尾必須包含且只包含一個下列格式的 json 圍欄：\n"
+            f"6. meeting_summary 的 integration_gates 可選填；只允許 {{\"kind\": \"python_unittest_discover\"}}，或 "
+            f"{{\"kind\": \"python_module\", \"module\": \"套件.模組\", \"args\": [\"相對路徑或旗標\"]}}。\n"
+            f"7. 輸出末尾必須包含且只包含一個下列格式的 json 圍欄：\n"
             f"{JSON_FENCE_OPEN}\n"
             f'{{"meeting_summary": {{"source_message_watermark": {len(_messages)}, "goal": "...", '
             f'"decisions": [], "non_goals": [], "global_constraints": [], "acceptance_criteria": [], '
@@ -1927,7 +2002,8 @@ def _dev_instruction(stage, **kw):
             f"4. 請依主持人最新發言修訂任務清單：已標記 status=done 的任務內容與狀態不可更動；"
             f"其餘可依插話內容新增、修改；輸出清單中缺少的未完成任務將被視為刪除。\n"
             f"5. 同棒更新完整 meeting_summary，source_message_watermark 應設為目前訊息數 {len(_messages)}。\n"
-            f"6. 輸出末尾必須包含且只包含一個下列格式的**完整**（非增量）json 圍欄：\n"
+            f"6. meeting_summary 的 integration_gates 可依新驗收需求更新；只允許 python_unittest_discover 或 python_module。\n"
+            f"7. 輸出末尾必須包含且只包含一個下列格式的**完整**（非增量）json 圍欄：\n"
             f"{JSON_FENCE_OPEN}\n"
             f'{{"meeting_summary": {{"source_message_watermark": {len(_messages)}, "goal": "...", '
             f'"decisions": [], "non_goals": [], "global_constraints": [], "acceptance_criteria": [], '
@@ -2006,8 +2082,9 @@ def _dev_instruction(stage, **kw):
             f"1. 專案目錄：{_project_dir}。只看 {kw['diff_range']} 的最終 net diff，不重讀歷史 commits。\n"
             f"2. 全部任務與驗收：\n{kw['tasks_json']}\n"
             f"3. 最終 name-status／stat：\n{kw['diff_block']}\n"
-            f"4. 適用的會議限制：\n{_summary_projection(include_acceptance=True)}\n"
-            f"5. 輸出最後一行必須是：\n{VERDICT_PASS}\n{VERDICT_FAIL_PREFIX}<一句話原因>\n"
+            f"4. 伺服器預先執行的整合 gate 證據：\n{kw.get('gate_results', '[]')}\n"
+            f"5. 適用的會議限制：\n{_summary_projection(include_acceptance=True)}\n"
+            f"6. 輸出最後一行必須是：\n{VERDICT_PASS}\n{VERDICT_FAIL_PREFIX}<一句話原因>\n"
             f"用繁體中文。絕對不要建立、修改或刪除任何檔案。"
         )
     raise ValueError(f"unknown dev stage: {stage}")
@@ -2220,10 +2297,17 @@ def _dev_run_integration_verify(data):
         key: task.get(key)
         for key in ("id", "title", "files", "acceptance", "status", "last_verdict")
     } for task in data.get("tasks", [])]
+    summary = _valid_saved_summary() or {}
+    gate_results = _run_integration_gates(summary.get("integration_gates", []))
+    data["integration_gate_results"] = gate_results
+    data["updated_at"] = _now()
+    _save_tasks(data)
     instr = _dev_instruction(
         "integration_verify", diff_range=diff_range, diff_block=diff_block,
         tasks_json=json.dumps(task_briefs, ensure_ascii=False, indent=1),
+        gate_results=json.dumps(gate_results, ensure_ascii=False, indent=1),
     )
+    gate_failures = [result for result in gate_results if result["status"] != "passed"]
     text, verdict = _protocol_call(
         seat, instr, _parse_verdict, "integration-verify", task_id=0,
         dev_role="verifier", data=data,
@@ -2232,6 +2316,12 @@ def _dev_run_integration_verify(data):
     if verdict is None:
         _dev_pause_state(data, "parse_fail")
         append_message("system", "⛔ 整合驗證輸出連續兩次不符協議格式，管線暫停。")
+        return False
+    if gate_failures and verdict["passed"]:
+        reason = "整合 gate 未通過：" + ", ".join(result["gate"]["kind"] for result in gate_failures)
+        data["integration_verdict"] = f"{VERDICT_FAIL_PREFIX}{reason}"
+        _dev_pause_state(data, "integration_gate_failed")
+        append_message("system", f"⏸ 收尾整合 gate 不通過，管線暫停：{reason}")
         return False
     if not verdict["passed"]:
         data["integration_verdict"] = f"{VERDICT_FAIL_PREFIX}{verdict['reason']}"
