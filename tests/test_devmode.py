@@ -139,9 +139,13 @@ class ProtocolParserTests(DevmodeTestCase):
             "acceptance": ["returns 200"],
         }
         text = self.fenced([]) + "\nignored\n" + self.fenced([valid])
-        self.assertEqual(server._parse_tasks(text), [valid])
+        self.assertEqual(server._parse_tasks(text), [{**valid, "verification_gates": []}])
         self.assertEqual(server._parse_tasks(self.fenced([]), allow_empty=True), [])
         self.assertIsNone(server._parse_tasks(self.fenced([])))
+
+        # 任務可選填 verification_gates（格式同 integration_gates），合法值原樣保留。
+        with_gate = {**valid, "verification_gates": [{"kind": server.INTEGRATION_GATE_UNITTEST}]}
+        self.assertEqual(server._parse_tasks(self.fenced([with_gate])), [with_gate])
 
         invalid = [
             {"id": 1, "title": "x", "acceptance": ["ok"]},
@@ -153,6 +157,8 @@ class ProtocolParserTests(DevmodeTestCase):
             {"id": 1, "title": "x", "files": [], "acceptance": []},
             {"id": 1, "title": "x", "files": [], "acceptance": [" "]},
             {"id": 1, "title": "x", "files": [], "acceptance": [1]},
+            # 任務 verification_gates 格式非法時，整份輸出視為不符協議（維持 strict）。
+            {"id": 1, "title": "x", "files": [], "acceptance": ["ok"], "verification_gates": [{"kind": "shell"}]},
         ]
         for item in invalid:
             with self.subTest(item=item):
@@ -178,6 +184,15 @@ class ProtocolParserTests(DevmodeTestCase):
             with self.subTest(invalid=invalid):
                 candidate = dict(summary, integration_gates=invalid)
                 self.assertIsNone(server._validate_meeting_summary(candidate))
+
+    def test_dispatch_and_digest_instructions_describe_task_verification_gates(self):
+        dispatch = server._dev_instruction("dispatch", tasks_json="{}")
+        digest = server._dev_instruction("digest", tasks_json="{}")
+        for instr in (dispatch, digest):
+            self.assertIn("verification_gates", instr)
+            self.assertIn("該任務驗證棒前", instr)
+            self.assertIn("python_unittest_discover", instr)
+            self.assertIn("python_module", instr)
 
     def test_verdict_and_arbitration_require_nonempty_detail(self):
         self.assertEqual(server._parse_verdict(server.VERDICT_PASS), {"passed": True, "reason": ""})
@@ -225,7 +240,7 @@ class ProtocolExecutionTests(DevmodeTestCase):
             task_id=0, dev_role="controller", data=data,
         )
 
-        self.assertEqual(parsed, [valid])
+        self.assertEqual(parsed, [{**valid, "verification_gates": []}])
         self.assertEqual(text, self.fenced([valid]))
         self.assertEqual(data["turn_count"], 2)
         self.assertEqual(server._dev["turn_count"], 2)
@@ -442,7 +457,8 @@ class GitIntegrationTests(DevmodeTestCase):
             self.assertTrue(server._dev_run_integration_verify(data))
         self.assertEqual(data["integration_gate_results"][0]["status"], "passed")
         self.assertIn("gate passed", calls[0]["instruction"])
-        self.assertEqual(run.call_args.args[1][1:5], ["-m", "unittest", "discover", "-s"])
+        # -v 讓 unittest 超時證據能指出卡在哪個測試。
+        self.assertEqual(run.call_args.args[1][1:], ["-m", "unittest", "discover", "-s", "tests", "-v"])
         with mock.patch.object(server, "_run_process", return_value=subprocess.CompletedProcess([], 1, "", "gate failed")):
             self.assertFalse(server._dev_run_integration_verify(data))
         self.assertEqual(data["pause_reason"], "integration_gate_failed")
@@ -458,6 +474,27 @@ class GitIntegrationTests(DevmodeTestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["returncode"], 1)
         self.assertEqual(result["stderr_tail"], "test failed")
+
+    def test_integration_gate_exception_rescues_partial_output_as_evidence(self):
+        gate = {"kind": server.INTEGRATION_GATE_UNITTEST}
+        python = self.project_dir / ".venv" / "Scripts" / "python.exe"
+        python.parent.mkdir(parents=True)
+        python.touch()
+
+        def fake_run_process(name, args, **kwargs):
+            server._last_run[name] = {
+                "args": args, "stdout": "ran some tests", "stderr": "hung on test_x",
+                "returncode": None, "elapsed": 600.0,
+            }
+            raise subprocess.TimeoutExpired(args, 600)
+
+        with mock.patch.object(server, "_run_process", side_effect=fake_run_process):
+            result = server._run_integration_gates([gate])[0]
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("ran some tests", result["stdout_tail"])
+        self.assertIn("hung on test_x", result["stderr_tail"])
+        self.assertIn("timed out", result["stderr_tail"])
 
     def test_v1_paused_resume_backfills_git_baselines_and_completes_verification(self):
         main = self.init_git()
@@ -728,8 +765,135 @@ class SafetyAndAdapterTests(DevmodeTestCase):
         self.assertIn("越界", calls[0]["instruction"])
         self.assertIn("base...HEAD", calls[0]["instruction"])
         self.assertNotIn("git show --stat", calls[0]["instruction"])
+        self.assertIn("收尾整合 gate", calls[0]["instruction"])
+        self.assertIn("不得因驗證席未親自執行而判定不通過", calls[0]["instruction"])
+        # 沒有已存的 meeting summary、且本任務未宣告 verification_gates 時，兩者都應有安全預設值。
+        self.assertIn("本任務 gate 實跑證據（伺服器已用專案 venv 實跑）：\n（本任務未宣告 gate）", calls[0]["instruction"])
+        self.assertIn("收尾整合 gate（僅於收尾實跑）：\n[]", calls[0]["instruction"])
         self.assertEqual(task["status"], "done")
         self.assertEqual(data["turn_count"], 1)
+
+    def test_verify_instruction_forwards_declared_integration_gates(self):
+        summary = {
+            "version": 1, "source_message_watermark": 0, "goal": "goal", "decisions": [],
+            "non_goals": [], "global_constraints": [], "acceptance_criteria": [], "open_questions": [],
+            "integration_gates": [{"kind": server.INTEGRATION_GATE_UNITTEST}], "updated_at": "now",
+        }
+        server._save_meeting_summary(summary)
+        task = self.task(status="in_progress", attempts=1)
+        data = self.state([task])
+        server._save_tasks(data)
+        calls = self.install_adapter("codex", [server.VERDICT_PASS])
+
+        with mock.patch.object(server, "_git_diff_summary", return_value=("base...HEAD", "final diff")):
+            task["base_commit"] = "base"
+            self.assertTrue(server._dev_run_verify(data, task))
+
+        self.assertIn("python_unittest_discover", calls[0]["instruction"])
+        self.assertIn("收尾整合 gate", calls[0]["instruction"])
+        self.assertIn("不得因驗證席未親自執行而判定不通過", calls[0]["instruction"])
+        # 本任務未宣告 verification_gates，本任務 gate 實跑證據應顯示安全預設值。
+        self.assertIn("本任務 gate 實跑證據（伺服器已用專案 venv 實跑）：\n（本任務未宣告 gate）", calls[0]["instruction"])
+
+    def test_task_verification_gate_passed_forwards_evidence_and_calls_verifier(self):
+        task = self.task(status="in_progress", attempts=1)
+        task["base_commit"] = "base"
+        task["verification_gates"] = [{"kind": server.INTEGRATION_GATE_UNITTEST}]
+        data = self.state([task])
+        server._save_tasks(data)
+        calls = self.install_adapter("codex", [server.VERDICT_PASS])
+        gate_result = server._integration_gate_result(
+            task["verification_gates"][0], "passed",
+            command=["python"], returncode=0, stdout="all tests green", stderr="", elapsed=0.1)
+
+        with mock.patch.object(server, "_git_diff_summary", return_value=("base...HEAD", "final diff")), \
+                mock.patch.object(server, "_run_integration_gates", return_value=[gate_result]) as run_gates:
+            self.assertTrue(server._dev_run_verify(data, task))
+
+        run_gates.assert_called_once_with(task["verification_gates"])
+        self.assertEqual(task["verification_gate_results"], [gate_result])
+        self.assertEqual(task["status"], "done")
+        self.assertEqual(task["attempts"], 1)
+        self.assertIn("本任務 gate 實跑證據（伺服器已用專案 venv 實跑）：", calls[0]["instruction"])
+        self.assertIn("all tests green", calls[0]["instruction"])
+        self.assertIn("據此判定，不得忽略失敗結果而判通過", calls[0]["instruction"])
+        saved = server._load_tasks()
+        self.assertEqual(saved["tasks"][0]["verification_gate_results"], [gate_result])
+
+    def test_task_verification_gate_failed_skips_verifier_with_concise_verdict(self):
+        task = self.task(status="in_progress", attempts=1)
+        task["base_commit"] = "base"
+        task["verification_gates"] = [{"kind": server.INTEGRATION_GATE_UNITTEST}]
+        data = self.state([task])
+        server._save_tasks(data)
+        calls = self.install_adapter("codex", [server.VERDICT_PASS])
+        long_output = "noise line\n" * 500 + "final failing assertion here"
+        fail_result = server._integration_gate_result(
+            task["verification_gates"][0], "failed",
+            command=["python"], returncode=1, stdout="", stderr=long_output, elapsed=0.1)
+
+        with mock.patch.object(server, "_run_integration_gates", return_value=[fail_result]):
+            self.assertTrue(server._dev_run_verify(data, task))
+
+        self.assertEqual(calls, [])  # 失敗時跳過驗證席呼叫
+        self.assertEqual(task["status"], "pending")
+        self.assertEqual(task["attempts"], 1)  # 不額外遞增 attempts（implement 已加過）
+        self.assertIn("驗證 gate 未通過", task["last_verdict"])
+        self.assertIn("python_unittest_discover exit=1", task["last_verdict"])
+        self.assertIn("verification_gate_results", task["last_verdict"])
+        self.assertNotIn(long_output, task["last_verdict"])  # 嚴禁把完整輸出塞進 last_verdict
+        self.assertLess(len(task["last_verdict"]), 400)
+        self.assertEqual(task["consecutive_same_failures"], 1)
+        self.assertEqual(data["status"], "running")
+        self.assertEqual(task["verification_gate_results"], [fail_result])
+
+    def test_task_verification_gate_failed_twice_with_same_reason_pauses(self):
+        task = self.task(status="in_progress", attempts=1)
+        task["base_commit"] = "base"
+        task["verification_gates"] = [{"kind": server.INTEGRATION_GATE_UNITTEST}]
+        data = self.state([task])
+        server._save_tasks(data)
+        fail_result = server._integration_gate_result(
+            task["verification_gates"][0], "failed",
+            command=["python"], returncode=1, stdout="", stderr="boom", elapsed=0.1)
+
+        with mock.patch.object(server, "_run_integration_gates", return_value=[fail_result]):
+            self.assertTrue(server._dev_run_verify(data, task))
+            task["status"] = "in_progress"  # 下一輪驗證棒重跑（attempts 不因 gate 失敗而遞增）
+            self.assertFalse(server._dev_run_verify(data, task))
+
+        self.assertEqual(data["status"], "paused")
+        self.assertEqual(data["pause_reason"], "repeated_failure")
+        self.assertEqual(task["consecutive_same_failures"], 2)
+        self.assertEqual(task["attempts"], 1)
+
+    def test_task_verification_gate_blocked_pauses_and_keeps_in_progress(self):
+        task = self.task(status="in_progress", attempts=1)
+        task["base_commit"] = "base"
+        task["verification_gates"] = [{"kind": server.INTEGRATION_GATE_UNITTEST}]
+        data = self.state([task])
+        server._save_tasks(data)
+        calls = self.install_adapter("codex", [server.VERDICT_PASS])
+        blocked_result = server._integration_gate_result(
+            task["verification_gates"][0], "blocked", stderr="找不到專案 .venv\\Scripts\\python.exe")
+
+        with mock.patch.object(server, "_run_integration_gates", return_value=[blocked_result]):
+            self.assertFalse(server._dev_run_verify(data, task))
+
+        self.assertEqual(calls, [])  # 驗證席未被呼叫
+        self.assertEqual(task["status"], "in_progress")
+        self.assertEqual(task["attempts"], 1)
+        self.assertEqual(task["last_failure_fingerprint"], "")
+        self.assertEqual(task["consecutive_same_failures"], 0)
+        self.assertEqual(data["status"], "paused")
+        self.assertEqual(data["pause_reason"], "verification_gate_blocked")
+        self.assertEqual(task["verification_gate_results"], [blocked_result])
+        saved = server._load_tasks()
+        self.assertEqual(saved["tasks"][0]["verification_gate_results"], [blocked_result])
+        self.assertEqual(saved["pause_reason"], "verification_gate_blocked")
+        self.assertIn("找不到專案", server._messages[-1]["text"])
+        # in_progress 讓續作時 _dev_next_action 直接重跑驗證棒，不重做實作、不耗 attempts。
+        self.assertEqual(server._dev_next_action(data), ("verify", task))
 
     def test_default_adapter_arguments_keep_discussion_readonly_and_pipeline_roles(self):
         agy_calls = []
@@ -971,6 +1135,9 @@ class D4FeatureTests(DevmodeTestCase):
         self.assertEqual(loaded["branch"], legacy["branch"])
         self.assertEqual(loaded["tasks"][0]["attempts"], 2)
         self.assertEqual(loaded["tasks"][0]["status"], "in_progress")
+        # 舊資料沒有 verification_gates／verification_gate_results 時，migrate 補上安全預設值。
+        self.assertEqual(loaded["tasks"][0]["verification_gates"], [])
+        self.assertEqual(loaded["tasks"][0]["verification_gate_results"], [])
         self.assertIn("sessions", loaded)
         self.assertIn("usage", loaded)
         self.assertEqual(json.loads(server.TASKS_FILE.read_text(encoding="utf-8"))["version"], 2)
