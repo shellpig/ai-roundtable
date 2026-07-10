@@ -109,6 +109,19 @@
     max-width: 860px; margin: 0 auto 10px; padding: 6px 12px; font-size: 13px;
     border: 1px solid #3c5677; border-radius: 8px; background: rgba(47,111,218,.12); color: var(--text);
   }
+  .dev-bar {
+    max-width: 860px; margin: 0 auto 10px; padding: 6px 12px; font-size: 13px;
+    border: 1px solid #7a4a35; border-radius: 8px; background: rgba(217,119,87,.12); color: var(--text);
+  }
+  .dev-bar.warn { border-color: #c04545; background: rgba(200,60,60,.18); color: #f2bcbc; }
+  .dev-bar .roles { color: var(--dim); font-size: 12px; margin-left: 8px; }
+  .dev-bar.warn .roles { color: inherit; }
+  #devBtn {
+    background: none; border: 1px solid #d97757; color: #d97757;
+    border-radius: 10px; padding: 0 16px; font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  #devBtn:hover { color: #fff; border-color: #e08a6e; }
+  #devBtn:disabled { opacity: .45; cursor: default; }
   #authGate {
     position: fixed; inset: 0; z-index: 20; background: rgba(16,20,24,.96);
     display: none; align-items: center; justify-content: center; padding: 20px;
@@ -152,9 +165,11 @@
 <main id="log"></main>
 <footer>
   <div id="discussBar" class="discuss-bar" style="display:none"></div>
+  <div id="devBar" class="dev-bar" style="display:none"></div>
   <div class="composer">
     <textarea id="input" placeholder="輸入發言…（Enter 送出，Shift+Enter 換行）"></textarea>
     <button id="sendBtn">送出</button>
+    <button id="devBtn" type="button" style="display:none"></button>
   </div>
   <div class="hint">
     <label class="opt"><input type="checkbox" id="consensusMode"> 共識討論模式</label>
@@ -475,6 +490,8 @@ async function poll() {
     updateRoleUi();
     renderSessionTitle();
     renderDiscussBar(j.discussion);
+    renderDevBar(j.dev);
+    renderDevBtn();
     if (enableInflight === 0) {
       // enabled seats 以伺服器為準（持久化、有預設值）
       state.enabled = {};
@@ -527,6 +544,80 @@ function renderDiscussBar(d) {
   }
 }
 
+// ---- 開發模式 UI（devBtn / devBar）----
+const DEV_STAGE_NAMES = {
+  dispatch: '拆任務', implement: '實作', verify: '驗證',
+  arbitrate: '仲裁', digest: '消化插話', handoff: '收尾', done: '已完成',
+};
+const DEV_PAUSE_REASONS = {
+  manual: '主持人手動暫停',
+  interject: '偵測到插話，待消化',
+  rate_limit: '偵測到模型用量限制，稍後按 ▶ 續作',
+  tamper: '⚠ 偵測到 data/ 檔案遭非伺服器途徑竄改',
+  parse_fail: '協議輸出連續不符格式',
+  seat_error: '席位呼叫失敗',
+  turn_cap: '已達總棒數上限，按 ▶ 重新授權一輪',
+  crash: '伺服器曾中斷，按 ▶ 從中斷任務續作',
+  ask_host: '仲裁詢問中，請回覆後按 ▶ 續作',
+};
+const ROLES_CUSTOM_WARN = '⚠ 非預設角色映射：能力與安全性由使用者自行確認';
+
+function devRolesText(d) {
+  const disp = n => (state.participants[n] && state.participants[n].display) || n || '?';
+  const r = d.roles || {};
+  return `主控 ${disp(r.controller)} · 實作 ${disp(r.implementer)} · 驗證 ${disp(r.verifier)}`;
+}
+
+function renderDevBar(d) {
+  const bar = $('devBar');
+  if (!d || !d.devmode || (!d.active && !d.paused)) { bar.style.display = 'none'; return; }
+  let text;
+  if (d.active) {
+    const stage = DEV_STAGE_NAMES[d.stage] || d.stage || '準備中';
+    const taskPart = d.current_task ? `任務 ${d.current_task}/${d.task_total} · ` : '';
+    text = `🛠 開發管線執行中 · ${taskPart}${stage} · ${d.branch || ''}`;
+  } else {
+    const reason = DEV_PAUSE_REASONS[d.pause_reason] || d.pause_reason || '';
+    text = `⏸ 開發管線已暫停 · ${reason} · ${d.branch || ''}`;
+  }
+  const roles = devRolesText(d) + (d.roles_custom ? `（${ROLES_CUSTOM_WARN}）` : '');
+  bar.className = 'dev-bar' + (d.pause_reason === 'tamper' ? ' warn' : '');
+  bar.innerHTML = `${esc(text)}<span class="roles">${esc(roles)}</span>`;
+  bar.style.display = '';
+}
+
+let devBtnInflight = false;
+function renderDevBtn() {
+  const btn = $('devBtn');
+  const d = state.dev || {};
+  const show = !!d.devmode && isHost();
+  btn.style.display = show ? '' : 'none';
+  if (!show) return;
+  btn.textContent = d.active ? '⏸ 暫停' : '▶ 開始執行';
+  btn.title = d.active ? '當前棒跑完後暫停管線'
+    : (d.paused ? '從暫停狀態續作管線' : '啟動開發管線（主控將讀逐字稿拆任務）');
+  btn.disabled = devBtnInflight;
+  // 開發模式徽章 tooltip 常駐顯示角色映射（管線未啟動時 devBar 不顯示）。
+  const badgeWarn = d.roles_custom ? `\n${ROLES_CUSTOM_WARN}` : '';
+  $('devBadge').title = `開發模式：AI 席位可對專案目錄讀寫\n${devRolesText(d)}${badgeWarn}`;
+}
+
+$('devBtn').onclick = async () => {
+  const d = state.dev || {};
+  const path = d.active ? '/api/dev/pause' : '/api/dev/start';
+  devBtnInflight = true;
+  renderDevBtn();
+  try {
+    const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) alert(j.error || '操作失敗');
+  } finally {
+    devBtnInflight = false;
+    await poll();
+    renderDevBtn();
+  }
+};
+
 $('sendBtn').onclick = send;
 $('input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
@@ -537,6 +628,11 @@ $('newBtn').onclick = async () => {
   if (r.ok) {
     const j = await r.json();
     state.sessionTitle = j.session_title || '未命名會議';
+  } else {
+    // 開發管線 active／未收尾 paused 時伺服器回 409 帶原因（規格 §5）
+    const j = await r.json().catch(() => ({}));
+    alert(j.error || '無法開新會議');
+    return;
   }
   $('log').innerHTML = ''; state.total = 0;
   renderSessionTitle();

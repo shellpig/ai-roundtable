@@ -2,6 +2,8 @@ import json
 import subprocess
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -605,6 +607,108 @@ class SafetyAndAdapterTests(DevmodeTestCase):
         self.assertIn("full stdout", content)
         self.assertIn("full stderr", content)
         self.assertIn("returncode: 0", content)
+
+class InterjectRoutingTests(DevmodeTestCase):
+    """規格 §5：管線 active／未收尾 paused 期間，人類發言只入逐字稿，不得啟動一般圓桌回覆。
+
+    走真 Handler（loopback 自動 HOST），把 start_batch／start_discussion 換成會失敗的 stub。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        self.port = self.httpd.server_address[1]
+        server.threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        super().tearDown()
+
+    def post(self, path, body):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode("utf-8"))
+
+    def failing_stubs(self):
+        return (
+            mock.patch.object(server, "start_batch", side_effect=AssertionError("start_batch called")),
+            mock.patch.object(server, "start_discussion", side_effect=AssertionError("start_discussion called")),
+        )
+
+    def test_send_during_active_pipeline_only_appends(self):
+        server._dev["active"] = True
+        batch_p, disc_p = self.failing_stubs()
+        with batch_p as batch, disc_p as disc:
+            status, j = self.post("/api/send", {"text": "任務 2 改用 pathlib", "ask": ["codex"]})
+
+        self.assertEqual(status, 200)
+        self.assertTrue(j.get("dev_pending"))
+        batch.assert_not_called()
+        disc.assert_not_called()
+        self.assertEqual(server._messages[-1]["text"], "任務 2 改用 pathlib")
+        self.assertEqual(server._messages[-1]["role"], "host")
+
+    def test_discussion_mode_send_during_paused_pipeline_only_appends(self):
+        server._dev["paused"] = True
+        batch_p, disc_p = self.failing_stubs()
+        with batch_p as batch, disc_p as disc:
+            status, j = self.post(
+                "/api/send",
+                {"text": "拍板：跳過任務 3", "mode": "discussion", "ask": ["codex"], "max_rounds": 3},
+            )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(j.get("dev_pending"))
+        batch.assert_not_called()
+        disc.assert_not_called()
+        self.assertEqual(server._messages[-1]["text"], "拍板：跳過任務 3")
+
+    def test_ask_rejected_while_pipeline_unfinished(self):
+        server._dev["paused"] = True
+        batch_p, _ = self.failing_stubs()
+        with batch_p as batch:
+            status, j = self.post("/api/ask", {"names": ["codex"]})
+
+        self.assertEqual(status, 409)
+        self.assertIn("管線", j.get("error", ""))
+        batch.assert_not_called()
+
+    def test_send_without_pipeline_still_starts_batch(self):
+        with mock.patch.object(server, "start_batch", return_value=[]) as batch:
+            status, j = self.post("/api/send", {"text": "hello", "ask": []})
+
+        self.assertEqual(status, 200)
+        self.assertNotIn("dev_pending", j)
+        batch.assert_called_once()
+
+
+class DevPayloadTests(DevmodeTestCase):
+    def test_roles_custom_flag_reflects_non_default_mapping(self):
+        with mock.patch.object(server, "DEVMODE", True):
+            self.assertFalse(server._dev_payload()["roles_custom"])
+
+            server._dev_roles.update(
+                {"controller": "codex", "implementer": "agy", "verifier": "claude"})
+            payload = server._dev_payload()
+
+        self.assertTrue(payload["roles_custom"])
+        self.assertEqual(payload["roles"]["controller"], "codex")
+
+    def test_roles_custom_ignores_key_order(self):
+        server._dev_roles.clear()
+        server._dev_roles.update(
+            {"verifier": "codex", "implementer": "agy", "controller": "claude"})
+        self.assertFalse(server._dev_roles_custom())
+
 
 if __name__ == "__main__":
     unittest.main()

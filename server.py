@@ -1983,6 +1983,19 @@ def _dev_request_pause():
         _dev_pause_requested = True
 
 
+def _dev_pipeline_engaged():
+    # 插話路由判斷（規格 §5）：管線執行中、或未收尾的暫停期間，人類訊息只入逐字稿
+    # 由管線消化（執行中靠棒後檢查、暫停靠續作水位），不得啟動一般圓桌回覆。
+    # 呼叫者不可持有 _lock。
+    with _lock:
+        return _dev["active"] or _dev["paused"]
+
+
+def _dev_roles_custom():
+    # 非預設角色映射（規格 §4）：能力與安全性由使用者自行確認；此旗標供 UI 顯示警告。
+    return dict(_dev_roles) != DEFAULT_DEV_ROLES
+
+
 def _dev_downgrade_crash():
     # 伺服器重啟時發現 tasks.json 仍是「執行中」→ 一定是異常結束（crash），降級為暫停。
     data = _load_tasks()
@@ -2010,16 +2023,17 @@ def _dev_load_from_tasks():
 
 
 def _dev_payload():
+    # 呼叫者必須已持有 _lock（threading.Lock 不可重入，內部再取鎖會死鎖）。
+    # 目前唯一呼叫點是 /api/state 的鎖內；鎖內做一次 tasks.json 小檔案讀取 v1 可接受。
     data = _load_tasks() if DEVMODE else None
     total = len(data.get("tasks", [])) if data else 0
-    with _lock:
-        return {
-            "devmode": DEVMODE, "roles": dict(_dev_roles),
-            "active": _dev["active"], "paused": _dev["paused"],
-            "pause_reason": _dev["pause_reason"], "stage": _dev["stage"],
-            "current_task": _dev["current_task"], "task_total": total,
-            "turn_count": _dev["turn_count"], "branch": _dev["branch"],
-        }
+    return {
+        "devmode": DEVMODE, "roles": dict(_dev_roles), "roles_custom": _dev_roles_custom(),
+        "active": _dev["active"], "paused": _dev["paused"],
+        "pause_reason": _dev["pause_reason"], "stage": _dev["stage"],
+        "current_task": _dev["current_task"], "task_total": total,
+        "turn_count": _dev["turn_count"], "branch": _dev["branch"],
+    }
 
 
 def _participants_payload():
@@ -2298,6 +2312,13 @@ class Handler(BaseHTTPRequestHandler):
             role = session.get("role")
             name = session.get("name", "HOST" if role == "host" else "Guest")
             speaker = "你" if role == "host" else name
+            if _dev_pipeline_engaged():
+                # 插話不得啟動一般圓桌回覆（規格 §5）：訊息只入逐字稿標記為待消化，
+                # 不呼叫 start_batch／start_discussion；mode=discussion 同樣被抑制。
+                if text:
+                    append_message(speaker, text, role=role, name=name)
+                self._json({"ok": True, "dev_pending": True})
+                return
             with _lock:
                 discussing = _discussion["active"]
             if discussing:
@@ -2327,6 +2348,10 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/ask":
             if session.get("role") != "host":
                 self._json({"error": "host required"}, 403)
+                return
+            if _dev_pipeline_engaged():
+                # 插話不得啟動一般圓桌回覆（規格 §5）：管線期間拒絕手動徵詢席位。
+                self._json({"error": "開發管線進行中或尚未收尾，一般圓桌回覆已暫停；發言將由管線消化"}, 409)
                 return
             self._json({"ok": True, "started": start_batch(payload.get("names"), reset_auto=True)})
         elif self.path == "/api/cancel":
