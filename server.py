@@ -60,6 +60,10 @@ DEV_INTEGRATION_GATE_TIMEOUT = int(os.environ.get("AI_ROUNDTABLE_INTEGRATION_GAT
 INTEGRATION_GATE_OUTPUT_TAIL = 2000
 INTEGRATION_GATE_UNITTEST = "python_unittest_discover"
 INTEGRATION_GATE_MODULE = "python_module"
+INTEGRATION_GATE_GODOT_IMPORT = "godot_import"
+INTEGRATION_GATE_GODOT_SCENE = "godot_scene"
+INTEGRATION_GATE_GODOT_SCRIPT = "godot_script"
+GODOT_EXE = os.path.expandvars(os.environ.get("AI_ROUNDTABLE_GODOT_EXE", "")).strip().strip('"')
 DEV_BRANCH_PREFIX = "roundtable/dev-"
 TASKS_FILE = DATA / "tasks.json"
 MEETING_SUMMARY_FILE = DATA / "meeting_summary.json"
@@ -1568,18 +1572,48 @@ def _integration_gate_result(gate, status, *, command=None, returncode=None, std
     }
 
 
+def _valid_godot_resource_path(value, suffix):
+    if (not isinstance(value, str) or len(value) > 512 or not value.startswith("res://")
+            or "\\" in value or any(char in value for char in "*?")):
+        return False
+    parts = value[len("res://"):].split("/")
+    return bool(parts) and all(part not in ("", ".", "..") for part in parts) and value.endswith(suffix)
+
+
+def _integration_gate_command(gate, project):
+    kind = gate["kind"]
+    if kind in (INTEGRATION_GATE_UNITTEST, INTEGRATION_GATE_MODULE):
+        python = project / ".venv" / "Scripts" / "python.exe"
+        if not python.is_file():
+            raise RuntimeError("找不到專案 .venv\\Scripts\\python.exe")
+        if kind == INTEGRATION_GATE_UNITTEST:
+            args = ["-m", "unittest", "discover", "-s", "tests", "-v"]
+        else:
+            args = ["-m", gate["module"], *gate["args"]]
+        return [str(python), *args], [str(Path(".venv") / "Scripts" / "python.exe"), *args]
+
+    godot = Path(GODOT_EXE) if GODOT_EXE else None
+    if godot is None or not godot.is_file():
+        raise RuntimeError("找不到 Godot executable；請設定 AI_ROUNDTABLE_GODOT_EXE")
+    args = ["--headless", "--path", "."]
+    if kind == INTEGRATION_GATE_GODOT_IMPORT:
+        args.append("--import")
+    elif kind == INTEGRATION_GATE_GODOT_SCENE:
+        args.append(gate["path"])
+    else:
+        args.extend(["-s", gate["path"]])
+    return [str(godot), *args], [str(godot), *args]
+
+
 def _run_integration_gates(gates):
     project = Path(_project_dir)
-    python = project / ".venv" / "Scripts" / "python.exe"
     results = []
     for gate in gates:
-        if not python.is_file():
-            results.append(_integration_gate_result(gate, "blocked", stderr="找不到專案 .venv\\Scripts\\python.exe"))
+        try:
+            command, display_command = _integration_gate_command(gate, project)
+        except RuntimeError as exc:
+            results.append(_integration_gate_result(gate, "blocked", stderr=str(exc)))
             continue
-        if gate["kind"] == INTEGRATION_GATE_UNITTEST:
-            command = [str(python), "-m", "unittest", "discover", "-s", "tests", "-v"]
-        else:
-            command = [str(python), "-m", gate["module"], *gate["args"]]
         env = os.environ.copy()
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         _last_run.pop("integration-gate", None)
@@ -1588,7 +1622,7 @@ def _run_integration_gates(gates):
             details = _last_run.get("integration-gate", {})
             results.append(_integration_gate_result(
                 gate, "passed" if completed.returncode == 0 else "failed",
-                command=[str(Path(".venv") / "Scripts" / "python.exe"), *command[1:]],
+                command=display_command,
                 returncode=completed.returncode, stdout=completed.stdout, stderr=completed.stderr,
                 elapsed=details.get("elapsed")))
         except Exception as exc:  # noqa: BLE001 - gate 啟動失敗需成為整合驗收證據
@@ -1597,7 +1631,7 @@ def _run_integration_gates(gates):
             if partial.get("stderr"):
                 stderr_msg = f"{stderr_msg}\n{partial['stderr']}"
             results.append(_integration_gate_result(
-                gate, "blocked", command=command[1:],
+                gate, "blocked", command=display_command,
                 stdout=partial.get("stdout") or "", stderr=stderr_msg))
     return results
 
@@ -1612,6 +1646,17 @@ def _validate_integration_gates(raw):
             if set(gate) != {"kind"}:
                 return None
             cleaned.append({"kind": INTEGRATION_GATE_UNITTEST})
+            continue
+        if gate["kind"] == INTEGRATION_GATE_GODOT_IMPORT:
+            if set(gate) != {"kind"}:
+                return None
+            cleaned.append({"kind": INTEGRATION_GATE_GODOT_IMPORT})
+            continue
+        if gate["kind"] in (INTEGRATION_GATE_GODOT_SCENE, INTEGRATION_GATE_GODOT_SCRIPT):
+            suffix = ".tscn" if gate["kind"] == INTEGRATION_GATE_GODOT_SCENE else ".gd"
+            if set(gate) != {"kind", "path"} or not _valid_godot_resource_path(gate.get("path"), suffix):
+                return None
+            cleaned.append({"kind": gate["kind"], "path": gate["path"]})
             continue
         if gate["kind"] != INTEGRATION_GATE_MODULE or set(gate) != {"kind", "module", "args"}:
             return None
@@ -1998,12 +2043,14 @@ def _dev_instruction(stage, **kw):
             f"3. 現行 tasks.json 內容如下（tasks 為空代表尚未拆過任務）：\n{kw['tasks_json']}\n"
             f"4. 請根據逐字稿中主持人交代的目標，拆出有序、可獨立驗收的任務清單，"
             f"每項包含 id（從 1 遞增整數）、title、files（涉及檔案路徑陣列）、acceptance（驗收條件陣列）。\n"
-            f"5. 每個 task 可選填 \"verification_gates\"（格式同 integration_gates，只允許 python_unittest_discover 或 "
-            f"python_module），由伺服器於該任務驗證棒前用專案 venv 實跑，適合宣告該任務完成後就該全綠的動態驗收；"
+            f"5. 每個 task 可選填 \"verification_gates\"（格式同 integration_gates，只允許 python_unittest_discover、"
+            f"python_module、godot_import、godot_scene 或 godot_script），由伺服器於該任務驗證棒前實跑，"
+            f"適合宣告該任務完成後就該全綠的動態驗收；"
             f"整案完成後才成立的驗收仍放 meeting_summary 的 integration_gates。\n"
             f"6. 同一份輸出也要建立會議摘要；source_message_watermark 應設為目前訊息數 {len(_messages)}。\n"
-            f"7. meeting_summary 的 integration_gates 可選填；只允許 {{\"kind\": \"python_unittest_discover\"}}，或 "
-            f"{{\"kind\": \"python_module\", \"module\": \"套件.模組\", \"args\": [\"相對路徑或旗標\"]}}。\n"
+            f"7. meeting_summary 的 integration_gates 可選填；Python gate 使用 python_unittest_discover 或 python_module；"
+            f"Godot gate 使用 godot_import，或 {{\"kind\": \"godot_scene\", \"path\": \"res://.../*.tscn\"}}，"
+            f"或 {{\"kind\": \"godot_script\", \"path\": \"res://.../*.gd\"}}。\n"
             f"8. 輸出末尾必須包含且只包含一個下列格式的 json 圍欄：\n"
             f"{JSON_FENCE_OPEN}\n"
             f'{{"meeting_summary": {{"source_message_watermark": {len(_messages)}, "goal": "...", '
@@ -2021,11 +2068,12 @@ def _dev_instruction(stage, **kw):
             f"3. 現行 tasks.json 內容：\n{kw['tasks_json']}\n"
             f"4. 請依主持人最新發言修訂任務清單：已標記 status=done 的任務內容與狀態不可更動；"
             f"其餘可依插話內容新增、修改；輸出清單中缺少的未完成任務將被視為刪除。\n"
-            f"5. 每個 task 可選填 \"verification_gates\"（格式同 integration_gates，只允許 python_unittest_discover 或 "
-            f"python_module），由伺服器於該任務驗證棒前用專案 venv 實跑，適合宣告該任務完成後就該全綠的動態驗收；"
+            f"5. 每個 task 可選填 \"verification_gates\"（格式同 integration_gates，只允許 python_unittest_discover、"
+            f"python_module、godot_import、godot_scene 或 godot_script），由伺服器於該任務驗證棒前實跑，"
+            f"適合宣告該任務完成後就該全綠的動態驗收；"
             f"整案完成後才成立的驗收仍放 meeting_summary 的 integration_gates。\n"
             f"6. 同棒更新完整 meeting_summary，source_message_watermark 應設為目前訊息數 {len(_messages)}。\n"
-            f"7. meeting_summary 的 integration_gates 可依新驗收需求更新；只允許 python_unittest_discover 或 python_module。\n"
+            f"7. meeting_summary 的 integration_gates 可依新驗收需求更新；允許上述 Python 與 Godot typed gates。\n"
             f"8. 輸出末尾必須包含且只包含一個下列格式的**完整**（非增量）json 圍欄：\n"
             f"{JSON_FENCE_OPEN}\n"
             f'{{"meeting_summary": {{"source_message_watermark": {len(_messages)}, "goal": "...", '
@@ -2092,7 +2140,7 @@ def _dev_instruction(stage, **kw):
             f"   驗收條件：{'; '.join(task.get('acceptance') or [])}\n"
             f"   適用的會議限制：\n{_summary_projection()}\n"
             f"3. 驗證 range：{kw['diff_range']}；最終 name-status／stat：\n{kw['diff_block']}\n"
-            f"4. 本任務 gate 實跑證據（伺服器已用專案 venv 實跑）：\n{kw.get('gate_results_json') or '（本任務未宣告 gate）'}\n"
+            f"4. 本任務 gate 實跑證據（伺服器已實跑）：\n{kw.get('gate_results_json') or '（本任務未宣告 gate）'}\n"
             f"   收尾整合 gate（僅於收尾實跑）：\n{kw.get('gates_json', '[]')}\n"
             f"5. 請先比對最終 net diff 與任務簡報範圍，凡最終仍動到與任務無關的檔案，"
             f"一律判定不通過並在原因中列出越界檔案；再檢查是否滿足本次任務簡報列出的驗收條件。"

@@ -173,6 +173,9 @@ class ProtocolParserTests(DevmodeTestCase):
         summary["integration_gates"] = [
             {"kind": server.INTEGRATION_GATE_UNITTEST},
             {"kind": server.INTEGRATION_GATE_MODULE, "module": "transcript_tool.cli", "args": ["roundtable.md"]},
+            {"kind": server.INTEGRATION_GATE_GODOT_IMPORT},
+            {"kind": server.INTEGRATION_GATE_GODOT_SCENE, "path": "res://tests/manual/test_runner.tscn"},
+            {"kind": server.INTEGRATION_GATE_GODOT_SCRIPT, "path": "res://tests/manual/verify_game_state.gd"},
         ]
         parsed = server._validate_meeting_summary(summary)
         self.assertEqual(parsed["integration_gates"], summary["integration_gates"])
@@ -180,6 +183,11 @@ class ProtocolParserTests(DevmodeTestCase):
             [{"kind": "shell", "args": ["dir"]}],
             [{"kind": server.INTEGRATION_GATE_MODULE, "module": "x;bad", "args": []}],
             [{"kind": server.INTEGRATION_GATE_MODULE, "module": "tool.cli", "args": ["..\\secret"]}],
+            [{"kind": server.INTEGRATION_GATE_GODOT_IMPORT, "path": "res://project.godot"}],
+            [{"kind": server.INTEGRATION_GATE_GODOT_SCENE, "path": "res://tests/manual/test_runner.gd"}],
+            [{"kind": server.INTEGRATION_GATE_GODOT_SCENE, "path": "res://tests/manual/*.tscn"}],
+            [{"kind": server.INTEGRATION_GATE_GODOT_SCRIPT, "path": "res://tests/../secret.gd"}],
+            [{"kind": server.INTEGRATION_GATE_GODOT_SCRIPT, "path": "C:\\secret.gd"}],
         ):
             with self.subTest(invalid=invalid):
                 candidate = dict(summary, integration_gates=invalid)
@@ -193,6 +201,9 @@ class ProtocolParserTests(DevmodeTestCase):
             self.assertIn("該任務驗證棒前", instr)
             self.assertIn("python_unittest_discover", instr)
             self.assertIn("python_module", instr)
+            self.assertIn("godot_import", instr)
+            self.assertIn("godot_scene", instr)
+            self.assertIn("godot_script", instr)
 
     def test_verdict_and_arbitration_require_nonempty_detail(self):
         self.assertEqual(server._parse_verdict(server.VERDICT_PASS), {"passed": True, "reason": ""})
@@ -496,6 +507,49 @@ class GitIntegrationTests(DevmodeTestCase):
         self.assertIn("hung on test_x", result["stderr_tail"])
         self.assertIn("timed out", result["stderr_tail"])
 
+    def test_godot_typed_gates_build_fixed_commands_and_record_evidence(self):
+        godot = self.root / "Godot.exe"
+        godot.touch()
+        gates = [
+            {"kind": server.INTEGRATION_GATE_GODOT_IMPORT},
+            {"kind": server.INTEGRATION_GATE_GODOT_SCENE, "path": "res://tests/manual/test_runner.tscn"},
+            {"kind": server.INTEGRATION_GATE_GODOT_SCRIPT, "path": "res://tests/manual/verify_game_state.gd"},
+        ]
+        completed = subprocess.CompletedProcess([], 0, "godot passed", "")
+        with mock.patch.object(server, "GODOT_EXE", str(godot)), \
+                mock.patch.object(server, "_run_process", return_value=completed) as run:
+            results = server._run_integration_gates(gates)
+
+        self.assertEqual([result["status"] for result in results], ["passed", "passed", "passed"])
+        commands = [call.args[1] for call in run.call_args_list]
+        self.assertEqual(commands[0], [str(godot), "--headless", "--path", ".", "--import"])
+        self.assertEqual(commands[1], [str(godot), "--headless", "--path", ".", "res://tests/manual/test_runner.tscn"])
+        self.assertEqual(commands[2], [str(godot), "--headless", "--path", ".", "-s", "res://tests/manual/verify_game_state.gd"])
+        self.assertEqual(results[0]["stdout_tail"], "godot passed")
+
+    def test_godot_gate_failure_records_returncode_and_stderr(self):
+        godot = self.root / "Godot.exe"
+        godot.touch()
+        gate = {"kind": server.INTEGRATION_GATE_GODOT_SCENE, "path": "res://tests/manual/test_runner.tscn"}
+        completed = subprocess.CompletedProcess([], 3, "", "scene parse failed")
+        with mock.patch.object(server, "GODOT_EXE", str(godot)), \
+                mock.patch.object(server, "_run_process", return_value=completed):
+            result = server._run_integration_gates([gate])[0]
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["returncode"], 3)
+        self.assertEqual(result["stderr_tail"], "scene parse failed")
+
+    def test_godot_gate_missing_executable_is_blocked_without_requiring_venv(self):
+        gate = {"kind": server.INTEGRATION_GATE_GODOT_IMPORT}
+        with mock.patch.object(server, "GODOT_EXE", str(self.root / "missing-godot.exe")), \
+                mock.patch.object(server, "_run_process") as run:
+            result = server._run_integration_gates([gate])[0]
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("AI_ROUNDTABLE_GODOT_EXE", result["stderr_tail"])
+        run.assert_not_called()
+
     def test_v1_paused_resume_backfills_git_baselines_and_completes_verification(self):
         main = self.init_git()
         branch = server._git_new_branch()
@@ -768,7 +822,7 @@ class SafetyAndAdapterTests(DevmodeTestCase):
         self.assertIn("收尾整合 gate", calls[0]["instruction"])
         self.assertIn("不得因驗證席未親自執行而判定不通過", calls[0]["instruction"])
         # 沒有已存的 meeting summary、且本任務未宣告 verification_gates 時，兩者都應有安全預設值。
-        self.assertIn("本任務 gate 實跑證據（伺服器已用專案 venv 實跑）：\n（本任務未宣告 gate）", calls[0]["instruction"])
+        self.assertIn("本任務 gate 實跑證據（伺服器已實跑）：\n（本任務未宣告 gate）", calls[0]["instruction"])
         self.assertIn("收尾整合 gate（僅於收尾實跑）：\n[]", calls[0]["instruction"])
         self.assertEqual(task["status"], "done")
         self.assertEqual(data["turn_count"], 1)
@@ -793,7 +847,7 @@ class SafetyAndAdapterTests(DevmodeTestCase):
         self.assertIn("收尾整合 gate", calls[0]["instruction"])
         self.assertIn("不得因驗證席未親自執行而判定不通過", calls[0]["instruction"])
         # 本任務未宣告 verification_gates，本任務 gate 實跑證據應顯示安全預設值。
-        self.assertIn("本任務 gate 實跑證據（伺服器已用專案 venv 實跑）：\n（本任務未宣告 gate）", calls[0]["instruction"])
+        self.assertIn("本任務 gate 實跑證據（伺服器已實跑）：\n（本任務未宣告 gate）", calls[0]["instruction"])
 
     def test_task_verification_gate_passed_forwards_evidence_and_calls_verifier(self):
         task = self.task(status="in_progress", attempts=1)
@@ -814,7 +868,7 @@ class SafetyAndAdapterTests(DevmodeTestCase):
         self.assertEqual(task["verification_gate_results"], [gate_result])
         self.assertEqual(task["status"], "done")
         self.assertEqual(task["attempts"], 1)
-        self.assertIn("本任務 gate 實跑證據（伺服器已用專案 venv 實跑）：", calls[0]["instruction"])
+        self.assertIn("本任務 gate 實跑證據（伺服器已實跑）：", calls[0]["instruction"])
         self.assertIn("all tests green", calls[0]["instruction"])
         self.assertIn("據此判定，不得忽略失敗結果而判通過", calls[0]["instruction"])
         saved = server._load_tasks()
